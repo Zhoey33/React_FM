@@ -1,0 +1,46 @@
+dataset:
+  data_path: "~/.cache/alfworld/json_2.1.1/train"
+  eval_id_data_path: "~/.cache/alfworld/json_2.1.1/valid_seen"
+  eval_ood_data_path: "~/.cache/alfworld/json_2.1.1/valid_unseen"
+  num_train_games: -1
+  num_eval_games: -1
+
+logic:
+  domain: "~/.cache/alfworld/logic/alfred.pddl"
+  grammar: "~/.cache/alfworld/logic/alfred.twl2"
+
+env:
+  type: "AlfredTWEnv"
+  regen_game_files: false
+  domain_randomization: false
+  task_types: [1, 2, 3, 4, 5, 6]
+  expert_timeout_steps: 150
+  expert_type: "handcoded"
+  goal_desc_human_anns_prob: 0
+
+general:
+  random_seed: 42
+  use_cuda: false
+  visdom: false
+  task: "alfred_tw"
+  training_method: "dagger"
+  observation_pool_capacity: 3
+  hide_init_receptacles: false
+  training:
+    batch_size: 10
+    max_episode: 50000
+    smoothing_eps: 0.1
+    optimizer:
+      learning_rate: 0.001
+      clip_grad_norm: 5
+  evaluate:
+    run_eval: true
+    batch_size: 10
+
+dagger:
+  training:
+    max_nb_steps_per_episode: 50
+
+rl:
+  training:
+    max_nb_steps_per_episode: 50

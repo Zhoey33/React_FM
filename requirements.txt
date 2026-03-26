@@ -1,0 +1,7 @@
+openai>=1.0.0
+pyyaml
+numpy
+alfworld[full]
+sentence-transformers
+scipy
+tqdm
