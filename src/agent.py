@@ -81,6 +81,7 @@ class ReactFMAgent:
         max_memory_inject: int = 3,
         enable_memory: bool = True,
         inject_mode: str = "in_loop",
+        memory_style: str = "original",
     ):
         self.llm = llm
         self.memory = memory_store
@@ -89,7 +90,8 @@ class ReactFMAgent:
         self.max_steps = max_steps
         self.max_memory_inject = max_memory_inject
         self.enable_memory = enable_memory and (memory_store is not None)
-        self.inject_mode = inject_mode  # "in_loop" or "episode"
+        self.inject_mode = inject_mode  # "in_loop", "episode", or "none"
+        self.memory_style = memory_style  # "original", "factual", "reflexion", "hint"
 
     def run_episode(self, env, env_idx: int = 0) -> EpisodeResult:
         """Run one ALFWorld episode."""
@@ -132,6 +134,7 @@ class ReactFMAgent:
                     task_obs=init_obs,
                     history=history,
                     retrieved_memories=episode_memories,
+                    memory_style=self.memory_style,
                 )
             else:
                 # In-loop mode: inject current_retrieved (set on failure)
@@ -140,6 +143,7 @@ class ReactFMAgent:
                     task_obs=init_obs,
                     history=history,
                     retrieved_memories=current_retrieved,
+                    memory_style=self.memory_style,
                 )
             response = self.llm.complete_text(
                 prompt, stop=["\n"], label=f"step_{step_num}"

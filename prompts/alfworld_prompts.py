@@ -53,6 +53,7 @@ def build_user_prompt(
     task_obs: str,
     history: list[tuple[str, str]],
     retrieved_memories: list | None = None,
+    memory_style: str = "original",
 ) -> str:
     """Build the user message in Reflexion-compatible format.
 
@@ -61,18 +62,45 @@ def build_user_prompt(
         task_obs: Initial task observation from env.reset()
         history: List of (action, observation) tuples so far
         retrieved_memories: List of FailureMemoryEntry objects (or None)
+        memory_style: Prompt style for memory injection:
+            "original" - current verbose style
+            "factual" - concise factual statements
+            "reflexion" - Reflexion-style "Your memory"
+            "hint" - minimal hint with first action only
     """
     sections = [build_fewshot_prefix(task_type)]
 
     if retrieved_memories:
-        memory_lines = [
-            "You can refer to these past failure-recovery experiences to help decide your next action."
-        ]
-        for entry in retrieved_memories:
-            memory_lines.append(
-                f"- failure: {entry.failure_action}, fix: {entry.solution_action}"
-            )
-        sections.append("\n".join(memory_lines))
+        if memory_style == "factual":
+            memory_lines = []
+            for entry in retrieved_memories:
+                memory_lines.append(
+                    f'Previously, "{entry.failure_action}" failed. The fix was: {entry.solution_action}'
+                )
+            sections.append("\n".join(memory_lines))
+        elif memory_style == "reflexion":
+            memory_lines = ["Your memory for this task:"]
+            for entry in retrieved_memories:
+                memory_lines.append(
+                    f'- "{entry.failure_action}" failed → fix: {entry.solution_action}'
+                )
+            sections.append("\n".join(memory_lines))
+        elif memory_style == "hint":
+            # Only show first action from solution
+            hints = []
+            for entry in retrieved_memories:
+                first_action = entry.solution_action.split(" → ")[0].strip()
+                hints.append(f'Hint: try "{first_action}" next.')
+            sections.append("\n".join(hints))
+        else:  # original
+            memory_lines = [
+                "You can refer to these past failure-recovery experiences to help decide your next action."
+            ]
+            for entry in retrieved_memories:
+                memory_lines.append(
+                    f"- failure: {entry.failure_action}, fix: {entry.solution_action}"
+                )
+            sections.append("\n".join(memory_lines))
 
     sections.append("Here is the task.\n" + task_obs)
     prompt = "\n\n".join(sections) + "\n"

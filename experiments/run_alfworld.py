@@ -43,6 +43,8 @@ def parse_args():
                         help="Memory injection mode: in_loop (on failure) or episode (at start)")
     parser.add_argument("--only-memory-envs", action="store_true",
                         help="Only run envs that have memory entries (skip rest)")
+    parser.add_argument("--memory-style", choices=["original", "factual", "reflexion", "hint"],
+                        default="original", help="Memory prompt style")
     return parser.parse_args()
 
 
@@ -203,6 +205,7 @@ def main():
         max_memory_inject=config["agent"]["max_memory_inject"],
         enable_memory=not is_baseline,
         inject_mode=args.inject_mode,
+        memory_style=args.memory_style,
     )
 
     # Determine which envs to run (for --only-memory-envs)
