@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument("--resume-results", type=str, default=None, help="Load previous epoch results to populate env_success for skip-on-success")
     parser.add_argument("--resume", action="store_true", help="Resume from last intermediate checkpoint")
     parser.add_argument("--run-name", type=str, default=None, help="Custom run name for results")
-    parser.add_argument("--inject-mode", choices=["in_loop", "episode"], default="in_loop",
+    parser.add_argument("--inject-mode", choices=["in_loop", "episode", "none"], default="in_loop",
                         help="Memory injection mode: in_loop (on failure) or episode (at start)")
     parser.add_argument("--only-memory-envs", action="store_true",
                         help="Only run envs that have memory entries (skip rest)")

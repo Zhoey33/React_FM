@@ -180,8 +180,8 @@ class ReactFMAgent:
 
             record = StepRecord(step=step_num, action=action, observation=observation)
 
-            # Failure detection + in-loop retrieval (only for in_loop mode)
-            if self.enable_memory and self.inject_mode == "in_loop" and not is_done:
+            # Failure detection + in-loop retrieval (for in_loop and none modes)
+            if self.enable_memory and self.inject_mode in ("in_loop", "none") and not is_done:
                 det = self.detector.detect(observation, action, action_history)
                 if det.is_failure:
                     record.failure_detected = True
@@ -189,20 +189,21 @@ class ReactFMAgent:
                     failures_detected += 1
                     logger.info(f"    FAILURE detected: {det.failure_type}")
 
-                    # Retrieve memories for next prompt (per-env)
-                    retrieved = self.memory.retrieve(
-                        query_action=action,
-                        query_observation=observation,
-                        task_type=task_type,
-                        top_k=self.max_memory_inject,
-                        env_idx=env_idx,
-                    )
-                    record.memory_retrieved = len(retrieved)
-                    memories_retrieved_total += len(retrieved)
+                    # Retrieve memories for next prompt (per-env, skip for "none" mode)
+                    if self.inject_mode == "in_loop":
+                        retrieved = self.memory.retrieve(
+                            query_action=action,
+                            query_observation=observation,
+                            task_type=task_type,
+                            top_k=self.max_memory_inject,
+                            env_idx=env_idx,
+                        )
+                        record.memory_retrieved = len(retrieved)
+                        memories_retrieved_total += len(retrieved)
 
-                    if retrieved:
-                        current_retrieved = retrieved
-                        logger.info(f"    Retrieved {len(retrieved)} memories")
+                        if retrieved:
+                            current_retrieved = retrieved
+                            logger.info(f"    Retrieved {len(retrieved)} memories")
 
             steps.append(record)
             history.append((action, observation))
@@ -257,7 +258,14 @@ class ReactFMAgent:
 
     def _extract_and_store(self, history: list[tuple[str, str]], task_type: str, env_idx: int = 0) -> int:
         """Extract failure-recovery pairs from trajectory and store in memory."""
-        recoveries = extract_failure_recoveries(self.extractor_llm, history)
+        # Filter to only valid env actions — exclude think and invalid LLM outputs
+        _VALID_PREFIXES = ("go to", "take", "put", "open", "close", "toggle",
+                           "clean", "cool", "heat", "use", "examine", "look", "inventory")
+        env_history = [
+            (a, o) for a, o in history
+            if a.lower().startswith(_VALID_PREFIXES)
+        ]
+        recoveries = extract_failure_recoveries(self.extractor_llm, env_history)
         stored = 0
         for rec in recoveries:
             self.memory.add(
