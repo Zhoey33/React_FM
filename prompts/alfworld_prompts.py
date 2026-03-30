@@ -11,6 +11,7 @@ with open(_PROMPT_FILE) as f:
 # Task types
 TASK_TYPES = ["put", "clean", "heat", "cool", "examine", "puttwo"]
 
+FEWSHOT_INTRO = "Interact with a household to solve a task. Here are two examples."
 SYSTEM_PROMPT_BASE = """You are a household robot agent. You complete tasks in a text-based environment by reasoning and choosing actions step by step.
 
 Each turn, output exactly ONE line:
@@ -23,18 +24,23 @@ Rules:
 - If an action fails ("Nothing happens"), think about why and try a different approach.
 - Do not repeat the exact same failed action unless the state has changed."""
 
-SYSTEM_PROMPT_FM = SYSTEM_PROMPT_BASE + """
-- If a [Hint from past experience] section appears, use it as reference but adapt to your current situation."""
+SYSTEM_PROMPT_FM = SYSTEM_PROMPT_BASE
 
 
 def get_fewshot_examples(task_type: str, num_examples: int = 2) -> str:
     """Get few-shot examples for a task type from Reflexion prompts."""
     examples = []
-    for i in range(num_examples):
+    for i in reversed(range(num_examples)):
         key = f"react_{task_type}_{i}"
         if key in _PROMPTS:
             examples.append(_PROMPTS[key])
     return "\n".join(examples)
+
+
+def build_fewshot_prefix(task_type: str, num_examples: int = 2) -> str:
+    """Build the shared few-shot prefix used by all action prompts."""
+    examples = get_fewshot_examples(task_type, num_examples=num_examples)
+    return FEWSHOT_INTRO + "\n" + examples
 
 
 def format_step(action: str, observation: str) -> str:
@@ -56,20 +62,23 @@ def build_user_prompt(
         history: List of (action, observation) tuples so far
         retrieved_memories: List of FailureMemoryEntry objects (or None)
     """
-    examples = get_fewshot_examples(task_type)
+    sections = [build_fewshot_prefix(task_type)]
 
-    prompt = "Interact with a household to solve a task. Here are two examples.\n"
-    prompt += examples
-    prompt += "\nHere is the task.\n" + task_obs + "\n"
+    if retrieved_memories:
+        memory_lines = [
+            "You can refer to these past failure-recovery experiences to help decide your next action."
+        ]
+        for entry in retrieved_memories:
+            memory_lines.append(
+                f"- failure: {entry.failure_action}, fix: {entry.solution_action}"
+            )
+        sections.append("\n".join(memory_lines))
+
+    sections.append("Here is the task.\n" + task_obs)
+    prompt = "\n\n".join(sections) + "\n"
 
     for action, obs in history:
         prompt += format_step(action, obs)
-
-    # Inject retrieved failure memories after the last observation
-    if retrieved_memories:
-        prompt += "[Hint from past experience: You can refer to these past failure-recovery experiences to help decide your next action.]\n"
-        for entry in retrieved_memories:
-            prompt += f"- failure: {entry.failure_action}, fix: {entry.solution_action}\n"
 
     prompt += "> "
     return prompt

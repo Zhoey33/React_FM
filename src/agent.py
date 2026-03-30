@@ -8,7 +8,7 @@ from src.llm import LLMClient
 from src.memory import FailureMemoryStore
 from src.failure_detector import ALFWorldFailureDetector, DetectionResult
 from src.memory_extractor import extract_failure_recoveries
-from prompts.alfworld_prompts import SYSTEM_PROMPT_BASE, SYSTEM_PROMPT_FM, build_user_prompt
+from prompts.alfworld_prompts import build_user_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,9 @@ class EpisodeResult:
     steps: list[StepRecord] = field(default_factory=list)
     total_steps: int = 0
     total_tokens: int = 0
+    agent_tokens: int = 0
+    judge_tokens: int = 0
+    extractor_tokens: int = 0
     failures_detected: int = 0
     memories_retrieved: int = 0
     memories_stored: int = 0
@@ -46,6 +49,9 @@ class EpisodeResult:
             "success": self.success,
             "total_steps": self.total_steps,
             "total_tokens": self.total_tokens,
+            "agent_tokens": self.agent_tokens,
+            "judge_tokens": self.judge_tokens,
+            "extractor_tokens": self.extractor_tokens,
             "failures_detected": self.failures_detected,
             "memories_retrieved": self.memories_retrieved,
             "memories_stored": self.memories_stored,
@@ -74,6 +80,7 @@ class ReactFMAgent:
         max_steps: int = 50,
         max_memory_inject: int = 3,
         enable_memory: bool = True,
+        inject_mode: str = "in_loop",
     ):
         self.llm = llm
         self.memory = memory_store
@@ -82,11 +89,17 @@ class ReactFMAgent:
         self.max_steps = max_steps
         self.max_memory_inject = max_memory_inject
         self.enable_memory = enable_memory and (memory_store is not None)
+        self.inject_mode = inject_mode  # "in_loop" or "episode"
 
     def run_episode(self, env, env_idx: int = 0) -> EpisodeResult:
         """Run one ALFWorld episode."""
         t0 = time.time()
         self.llm.tracker.reset()
+        # Reset judge/extractor trackers for per-episode stats
+        if self.detector.judge_llm is not None:
+            self.detector.judge_llm.tracker.reset()
+        if self.extractor_llm is not None:
+            self.extractor_llm.tracker.reset()
 
         # Reset environment
         init_obs, task_type, info = env.reset()
@@ -101,22 +114,41 @@ class ReactFMAgent:
         failures_detected = 0
         memories_retrieved_total = 0
 
+        # Episode-level injection: retrieve all memories at start
+        episode_memories: list | None = None
+        if self.enable_memory and self.inject_mode == "episode":
+            all_mem = self.memory.get_all(env_idx=env_idx)
+            if all_mem:
+                episode_memories = all_mem[:self.max_memory_inject]
+                memories_retrieved_total = len(episode_memories)
+                logger.info(f"  Episode-level: injecting {len(episode_memories)} memories for env {env_idx}")
+
         for step_num in range(self.max_steps):
             # Build prompt
-            prompt = build_user_prompt(
-                task_type=task_type,
-                task_obs=init_obs,
-                history=history,
-                retrieved_memories=current_retrieved,
-            )
+            if self.inject_mode == "episode":
+                # Episode mode: inject episode_memories every step
+                prompt = build_user_prompt(
+                    task_type=task_type,
+                    task_obs=init_obs,
+                    history=history,
+                    retrieved_memories=episode_memories,
+                )
+            else:
+                # In-loop mode: inject current_retrieved (set on failure)
+                prompt = build_user_prompt(
+                    task_type=task_type,
+                    task_obs=init_obs,
+                    history=history,
+                    retrieved_memories=current_retrieved,
+                )
             response = self.llm.complete_text(
-                prompt, stop=["\n"], label=f"step_{step_num}",
-                system=SYSTEM_PROMPT_FM if self.enable_memory else SYSTEM_PROMPT_BASE
+                prompt, stop=["\n"], label=f"step_{step_num}"
             )
             action = response.strip().split("\n")[0].strip()
 
-            # Clear retrieved memories after use
-            current_retrieved = None
+            # Clear retrieved memories after use (in-loop only)
+            if self.inject_mode == "in_loop":
+                current_retrieved = None
 
             # Strip "> " prefix if LLM outputs in Reflexion format
             if action.startswith("> "):
@@ -148,8 +180,8 @@ class ReactFMAgent:
 
             record = StepRecord(step=step_num, action=action, observation=observation)
 
-            # Failure detection (only for React_FM)
-            if self.enable_memory and not is_done:
+            # Failure detection + in-loop retrieval (only for in_loop mode)
+            if self.enable_memory and self.inject_mode == "in_loop" and not is_done:
                 det = self.detector.detect(observation, action, action_history)
                 if det.is_failure:
                     record.failure_detected = True
@@ -157,12 +189,13 @@ class ReactFMAgent:
                     failures_detected += 1
                     logger.info(f"    FAILURE detected: {det.failure_type}")
 
-                    # Retrieve memories for next prompt
+                    # Retrieve memories for next prompt (per-env)
                     retrieved = self.memory.retrieve(
                         query_action=action,
                         query_observation=observation,
                         task_type=task_type,
                         top_k=self.max_memory_inject,
+                        env_idx=env_idx,
                     )
                     record.memory_retrieved = len(retrieved)
                     memories_retrieved_total += len(retrieved)
@@ -182,11 +215,20 @@ class ReactFMAgent:
         memories_stored = 0
         if self.enable_memory and self.extractor_llm is not None:
             logger.info(f"  Extracting failure-recovery pairs...")
-            memories_stored = self._extract_and_store(history, task_type)
+            memories_stored = self._extract_and_store(history, task_type, env_idx)
             logger.info(f"  Extracted and stored {memories_stored} memories")
 
         wall_time = time.time() - t0
-        token_stats = self.llm.tracker.summary()
+
+        # Token stats — separate agent / judge / extractor
+        agent_stats = self.llm.tracker.summary()
+        judge_tokens = 0
+        if self.detector.judge_llm is not None:
+            judge_tokens = self.detector.judge_llm.tracker.summary()["total_tokens"]
+        extractor_tokens = 0
+        if self.extractor_llm is not None:
+            extractor_tokens = self.extractor_llm.tracker.summary()["total_tokens"]
+        total_tokens = agent_stats["total_tokens"] + judge_tokens + extractor_tokens
 
         result = EpisodeResult(
             env_idx=env_idx,
@@ -195,7 +237,10 @@ class ReactFMAgent:
             success=success,
             steps=steps,
             total_steps=len(steps),
-            total_tokens=token_stats["total_tokens"],
+            total_tokens=total_tokens,
+            agent_tokens=agent_stats["total_tokens"],
+            judge_tokens=judge_tokens,
+            extractor_tokens=extractor_tokens,
             failures_detected=failures_detected,
             memories_retrieved=memories_retrieved_total,
             memories_stored=memories_stored,
@@ -205,12 +250,12 @@ class ReactFMAgent:
         status = "SUCCESS" if success else "FAIL"
         logger.info(
             f"Env #{env_idx} [{task_type}] {status} in {len(steps)} steps, "
-            f"{token_stats['total_tokens']} tokens, "
+            f"tokens={total_tokens} (agent={agent_stats['total_tokens']}, judge={judge_tokens}, ext={extractor_tokens}), "
             f"failures={failures_detected}, mem_retrieved={memories_retrieved_total}, mem_stored={memories_stored}"
         )
         return result
 
-    def _extract_and_store(self, history: list[tuple[str, str]], task_type: str) -> int:
+    def _extract_and_store(self, history: list[tuple[str, str]], task_type: str, env_idx: int = 0) -> int:
         """Extract failure-recovery pairs from trajectory and store in memory."""
         recoveries = extract_failure_recoveries(self.extractor_llm, history)
         stored = 0
@@ -220,6 +265,7 @@ class ReactFMAgent:
                 failure_observation=rec["failure_observation"],
                 solution_action=rec["solution_action"],
                 task_type=task_type,
+                env_idx=env_idx,
             )
             stored += 1
         return stored

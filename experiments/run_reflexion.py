@@ -17,6 +17,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from prompts.alfworld_prompts import build_fewshot_prefix
 from src.llm import LLMClient
 from src.alfworld_env import ALFWorldEnv, get_task_type
 from src.reflexion_agent import (
@@ -48,7 +49,10 @@ def main():
     seed = args.seed or config["experiment"]["seed"]
     random.seed(seed)
     np.random.seed(seed)
-    results_dir = config["experiment"]["results_dir"]
+
+    # Timestamp-based output directory
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    results_dir = f"{config['experiment']['results_dir']}/{timestamp}"
 
     # Logging: console (INFO) + file (DEBUG)
     setup_logging(
@@ -65,11 +69,6 @@ def main():
         temperature=config["llm"]["temperature"],
         max_tokens=config["llm"]["max_tokens"],
     )
-
-    # Load few-shot prompts
-    prompt_file = Path(__file__).parent.parent / "prompts" / "alfworld_3prompts.json"
-    with open(prompt_file) as f:
-        d = json.load(f)
 
     # Initialize env configs (same structure as Reflexion repo)
     env_configs = []
@@ -116,11 +115,7 @@ def main():
                 continue
 
             # Build base prompt with 2 few-shot examples
-            base_prompt = (
-                "Interact with a household to solve a task. Here are two examples.\n"
-                + d.get(f"react_{task_prefix}_1", "")
-                + d.get(f"react_{task_prefix}_0", "")
-            )
+            base_prompt = build_fewshot_prefix(task_prefix)
 
             # Run episode with memory from past trials
             t0 = time.time()

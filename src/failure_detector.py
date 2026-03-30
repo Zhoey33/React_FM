@@ -7,12 +7,16 @@ from src.llm import LLMClient
 
 logger = logging.getLogger(__name__)
 
-JUDGE_PROMPT = """You are judging whether an action succeeded in a household environment.
+JUDGE_PROMPT = """You are judging whether an agent's interaction was productive in an interactive environment.
 
 Action: {action}
 Observation: {observation}
 
-Did the action achieve its intended effect? Answer only "yes" or "no"."""
+An interaction is PRODUCTIVE if the agent gained useful new information (e.g., discovered objects, learned a location's contents, learned a receptacle's state) or changed the environment state (e.g., moved, picked up, opened, cleaned).
+
+An interaction is UNPRODUCTIVE only if the observation provides zero new information and no state change occurred (e.g., "Nothing happens", empty response, or exact repetition of prior state with no new details).
+
+Was this interaction productive? Answer only "yes" or "no"."""
 
 
 @dataclass
@@ -68,7 +72,7 @@ class ALFWorldFailureDetector:
         return DetectionResult(is_failure=False)
 
     def _judge_intent(self, action: str, observation: str) -> DetectionResult:
-        """Use a lightweight LLM to judge if action achieved its intent."""
+        """Use a lightweight LLM to judge if interaction was productive."""
         prompt = JUDGE_PROMPT.format(action=action, observation=observation)
         try:
             response = self.judge_llm.complete_text(prompt, label="judge")
@@ -76,8 +80,8 @@ class ALFWorldFailureDetector:
             if answer.startswith("no"):
                 return DetectionResult(
                     is_failure=True,
-                    failure_type="intent_mismatch",
-                    reason=f"Judge: action '{action}' did not achieve intent (obs: '{observation[:80]}')",
+                    failure_type="unproductive",
+                    reason=f"Judge: interaction not productive (action: '{action}', obs: '{observation[:80]}')",
                 )
         except Exception as e:
             logger.warning(f"Judge LLM call failed: {e}")

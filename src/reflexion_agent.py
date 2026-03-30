@@ -23,20 +23,6 @@ PREFIXES = {
     "look_at_obj": "examine",
     "pick_two_obj": "puttwo",
 }
-
-SYSTEM_PROMPT = """You are a household robot agent. You complete tasks in a text-based environment by reasoning and choosing actions step by step.
-
-Each turn, output exactly ONE line:
-- think: [your reasoning]
-- Or a valid action: go to, take, put, open, close, toggle, clean, cool, heat, use, examine, look, inventory
-
-Rules:
-- Open closed receptacles before taking items from them.
-- You can carry only one object at a time.
-- If an action fails ("Nothing happens"), think about why and try a different approach.
-- Do not repeat the exact same failed action unless the state has changed."""
-
-
 class EnvironmentHistory:
     """Tracks the history of actions and observations for one episode.
     Reproduces env_history.py from the Reflexion repo.
@@ -50,13 +36,14 @@ class EnvironmentHistory:
 
     @staticmethod
     def _build_base_query(base_prompt: str, start_info: str, memory: list[str]) -> str:
-        query = base_prompt
+        sections = [base_prompt]
         if memory:
-            query += "\n\nYour memory for the task below:"
+            memory_lines = ["Your memory for the task below:"]
             for i, m in enumerate(memory):
-                query += f"\nTrial {i}:\n{m.strip()}"
-        query += f"\nHere is the task:\n{start_info}"
-        return query
+                memory_lines.append(f"Trial {i}:\n{m.strip()}")
+            sections.append("\n".join(memory_lines))
+        sections.append(f"Here is the task:\n{start_info}")
+        return "\n\n".join(sections)
 
     def add(self, label: str, value: str):
         self._history.append({"label": label, "value": value})

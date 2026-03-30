@@ -64,7 +64,7 @@ class LLMClient:
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.tracker = TokenTracker()
-        self.client = OpenAI(base_url=base_url, api_key=api_key, timeout=60.0)
+        self.client = OpenAI(base_url=base_url, api_key=api_key, timeout=120.0)
 
     def chat(
         self,

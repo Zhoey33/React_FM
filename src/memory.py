@@ -1,4 +1,7 @@
-"""Failure Memory Store with hybrid BM25 + Embedding retrieval (RRF fusion)."""
+"""Failure Memory Store with hybrid BM25 + Embedding retrieval (RRF fusion).
+
+Per-env storage: each env_idx maintains its own memory entries.
+"""
 
 import json
 import logging
@@ -19,6 +22,7 @@ class FailureMemoryEntry:
     failure_observation: str
     solution_action: str
     task_type: str = ""
+    env_idx: int = 0
     created_at: str = ""
     embedding: np.ndarray | None = None
 
@@ -35,6 +39,7 @@ class FailureMemoryEntry:
             "failure_observation": self.failure_observation,
             "solution_action": self.solution_action,
             "task_type": self.task_type,
+            "env_idx": self.env_idx,
             "created_at": self.created_at,
         }
 
@@ -49,15 +54,13 @@ class FailureMemoryStore:
         min_score: float = 0.0,
     ):
         self.embedding_model_name = embedding_model_name
-        self.max_entries = max_entries
+        self.max_entries = max_entries  # per-env max
         self.top_k = top_k
         self.rrf_k = rrf_k
         self.min_score = min_score
-        self.entries: list[FailureMemoryEntry] = []
+        self._env_entries: dict[int, list[FailureMemoryEntry]] = {}
         self._next_id = 0
         self._model = None
-        self._bm25: BM25Okapi | None = None
-        self._bm25_corpus: list[list[str]] = []  # tokenized docs for BM25
         # tracking
         self.total_retrievals = 0
         self.total_hits = 0  # retrievals that returned >=1 result
@@ -81,20 +84,13 @@ class FailureMemoryStore:
     def _build_query_text(self, action: str, observation: str) -> str:
         return f"{action} | {observation}"
 
-    def _rebuild_bm25(self, candidates: list[FailureMemoryEntry]) -> BM25Okapi:
-        """Build BM25 index from candidate entries."""
-        corpus = [
-            self._tokenize(self._build_query_text(e.failure_action, e.failure_observation))
-            for e in candidates
-        ]
-        return BM25Okapi(corpus)
-
     def add(
         self,
         failure_action: str,
         failure_observation: str,
         solution_action: str,
         task_type: str = "",
+        env_idx: int = 0,
     ) -> FailureMemoryEntry:
         query_text = self._build_query_text(failure_action, failure_observation)
         embedding = self._embed(query_text)
@@ -105,19 +101,20 @@ class FailureMemoryStore:
             failure_observation=failure_observation,
             solution_action=solution_action,
             task_type=task_type,
+            env_idx=env_idx,
             created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
             embedding=embedding,
         )
-        self.entries.append(entry)
+
+        if env_idx not in self._env_entries:
+            self._env_entries[env_idx] = []
+        self._env_entries[env_idx].append(entry)
         self._next_id += 1
 
-        if len(self.entries) > self.max_entries:
-            self.entries.pop(0)
+        if len(self._env_entries[env_idx]) > self.max_entries:
+            self._env_entries[env_idx].pop(0)
 
-        # Invalidate BM25 cache (will rebuild on next retrieve)
-        self._bm25 = None
-
-        logger.info(f"Memory stored #{entry.memory_id}: [{task_type}] {failure_action[:50]}... → {solution_action[:50]}...")
+        logger.info(f"Memory stored #{entry.memory_id} [env={env_idx}]: [{task_type}] {failure_action[:50]}... → {solution_action[:50]}...")
         return entry
 
     def retrieve(
@@ -126,17 +123,18 @@ class FailureMemoryStore:
         query_observation: str,
         task_type: str = "",
         top_k: int | None = None,
+        env_idx: int = 0,
     ) -> list[FailureMemoryEntry]:
         self.total_retrievals += 1
         k = top_k or self.top_k
 
-        if not self.entries:
+        candidates = self._env_entries.get(env_idx, [])
+        if not candidates:
             return []
 
         # Filter by task_type if provided
-        candidates = self.entries
         if task_type:
-            typed = [e for e in self.entries if e.task_type == task_type]
+            typed = [e for e in candidates if e.task_type == task_type]
             if typed:
                 candidates = typed
 
@@ -145,9 +143,13 @@ class FailureMemoryStore:
         query_emb = self._embed(query_text)
 
         # --- BM25 ranking ---
-        bm25 = self._rebuild_bm25(candidates)
+        corpus = [
+            self._tokenize(self._build_query_text(e.failure_action, e.failure_observation))
+            for e in candidates
+        ]
+        bm25 = BM25Okapi(corpus)
         bm25_scores = bm25.get_scores(query_tokens)
-        bm25_ranking = np.argsort(-bm25_scores)  # indices sorted by descending score
+        bm25_ranking = np.argsort(-bm25_scores)
 
         # --- Embedding ranking ---
         emb_scores = []
@@ -178,7 +180,7 @@ class FailureMemoryStore:
         if results:
             self.total_hits += 1
             logger.debug(
-                f"Memory retrieved {len(results)} entries (RRF) for: {query_action[:50]}... "
+                f"Memory retrieved {len(results)} entries [env={env_idx}] for: {query_action[:50]}... "
                 f"top_rrf={rrf_scores[sorted_indices[0]]:.4f}"
             )
 
@@ -190,17 +192,20 @@ class FailureMemoryStore:
 
         data = {
             "next_id": self._next_id,
-            "entries": [],
+            "envs": {},
         }
-        for entry in self.entries:
-            d = entry.to_dict()
-            if entry.embedding is not None:
-                d["embedding"] = entry.embedding.tolist()
-            data["entries"].append(d)
+        for env_idx, entries in self._env_entries.items():
+            env_data = []
+            for entry in entries:
+                d = entry.to_dict()
+                if entry.embedding is not None:
+                    d["embedding"] = entry.embedding.tolist()
+                env_data.append(d)
+            data["envs"][str(env_idx)] = env_data
 
         with open(path, "w") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        logger.info(f"Memory saved: {len(self.entries)} entries → {filepath}")
+        logger.info(f"Memory saved: {self.size()} entries ({len(self._env_entries)} envs) → {filepath}")
 
     def load(self, filepath: str) -> None:
         path = Path(filepath)
@@ -212,35 +217,49 @@ class FailureMemoryStore:
             data = json.load(f)
 
         self._next_id = data.get("next_id", 0)
-        self.entries.clear()
+        self._env_entries.clear()
 
-        for d in data.get("entries", []):
-            emb = None
-            if "embedding" in d:
-                emb = np.array(d["embedding"], dtype=np.float32)
+        for env_idx_str, entries_data in data.get("envs", {}).items():
+            env_idx = int(env_idx_str)
+            self._env_entries[env_idx] = []
+            for d in entries_data:
+                emb = None
+                if "embedding" in d:
+                    emb = np.array(d["embedding"], dtype=np.float32)
 
-            entry = FailureMemoryEntry(
-                memory_id=d["memory_id"],
-                failure_action=d["failure_action"],
-                failure_observation=d["failure_observation"],
-                solution_action=d["solution_action"],
-                task_type=d.get("task_type", ""),
-                created_at=d.get("created_at", ""),
-                embedding=emb,
-            )
-            self.entries.append(entry)
+                entry = FailureMemoryEntry(
+                    memory_id=d["memory_id"],
+                    failure_action=d["failure_action"],
+                    failure_observation=d["failure_observation"],
+                    solution_action=d["solution_action"],
+                    task_type=d.get("task_type", ""),
+                    env_idx=env_idx,
+                    created_at=d.get("created_at", ""),
+                    embedding=emb,
+                )
+                self._env_entries[env_idx].append(entry)
 
-        logger.info(f"Memory loaded: {len(self.entries)} entries from {filepath}")
+        logger.info(f"Memory loaded: {self.size()} entries ({len(self._env_entries)} envs) from {filepath}")
+
+    def get_all(self, env_idx: int = 0) -> list[FailureMemoryEntry]:
+        """Return all entries for a given env_idx."""
+        return list(self._env_entries.get(env_idx, []))
+
+    def get_env_ids(self) -> set[int]:
+        """Return set of env_idxs that have memory entries."""
+        return set(self._env_entries.keys())
 
     def size(self) -> int:
-        return len(self.entries)
+        return sum(len(entries) for entries in self._env_entries.values())
 
     def stats(self) -> dict:
         by_type: dict[str, int] = {}
-        for e in self.entries:
-            by_type[e.task_type] = by_type.get(e.task_type, 0) + 1
+        for entries in self._env_entries.values():
+            for e in entries:
+                by_type[e.task_type] = by_type.get(e.task_type, 0) + 1
         return {
-            "total_entries": len(self.entries),
+            "total_entries": self.size(),
+            "num_envs_with_memory": len(self._env_entries),
             "entries_by_task_type": by_type,
             "total_retrievals": self.total_retrievals,
             "total_hits": self.total_hits,

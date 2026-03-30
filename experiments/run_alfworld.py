@@ -36,8 +36,13 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=None, help="Override seed")
     parser.add_argument("--baseline", action="store_true", help="Run as vanilla ReAct (no memory)")
     parser.add_argument("--resume-memory", type=str, default=None, help="Load memory from file before starting")
+    parser.add_argument("--resume-results", type=str, default=None, help="Load previous epoch results to populate env_success for skip-on-success")
     parser.add_argument("--resume", action="store_true", help="Resume from last intermediate checkpoint")
     parser.add_argument("--run-name", type=str, default=None, help="Custom run name for results")
+    parser.add_argument("--inject-mode", choices=["in_loop", "episode"], default="in_loop",
+                        help="Memory injection mode: in_loop (on failure) or episode (at start)")
+    parser.add_argument("--only-memory-envs", action="store_true",
+                        help="Only run envs that have memory entries (skip rest)")
     return parser.parse_args()
 
 
@@ -70,6 +75,9 @@ def compute_summary(results: list[dict], memory_stats: dict, mode: str) -> dict:
         v["rate"] = round(v["success"] / v["total"], 4) if v["total"] > 0 else 0
 
     total_tokens = sum(r["total_tokens"] for r in results)
+    agent_tokens = sum(r.get("agent_tokens", r["total_tokens"]) for r in results)
+    judge_tokens = sum(r.get("judge_tokens", 0) for r in results)
+    extractor_tokens = sum(r.get("extractor_tokens", 0) for r in results)
     total_failures = sum(r["failures_detected"] for r in results)
 
     return {
@@ -79,6 +87,9 @@ def compute_summary(results: list[dict], memory_stats: dict, mode: str) -> dict:
         "success_rate": round(successes / total, 4) if total > 0 else 0,
         "by_task_type": by_type,
         "total_tokens": total_tokens,
+        "agent_tokens": agent_tokens,
+        "judge_tokens": judge_tokens,
+        "extractor_tokens": extractor_tokens,
         "avg_tokens_per_episode": round(total_tokens / total) if total > 0 else 0,
         "total_failures_detected": total_failures,
         "memory_stats": memory_stats,
@@ -99,7 +110,10 @@ def log_summary(summary: dict):
         logger.info(f"  {tt:<12} {stats['success']:>8} {stats['total']:>8} {stats['rate']:>7.1%}")
     logger.info("-" * 60)
     logger.info(f"  Tokens: {summary['total_tokens']:,} total, "
-                f"{summary['avg_tokens_per_episode']:,} avg/episode")
+                f"{summary['avg_tokens_per_episode']:,} avg/episode "
+                f"(agent={summary.get('agent_tokens', 0):,}, "
+                f"judge={summary.get('judge_tokens', 0):,}, "
+                f"ext={summary.get('extractor_tokens', 0):,})")
     if summary["memory_stats"]:
         ms = summary["memory_stats"]
         logger.info(f"  Memory: {ms.get('total_entries', 0)} entries, "
@@ -119,10 +133,14 @@ def main():
     seed = args.seed or config["experiment"]["seed"]
     set_seed(seed)
     num_epochs = args.epochs or config["experiment"]["num_epochs"]
-    results_dir = config["experiment"]["results_dir"]
     is_baseline = args.baseline
     mode = "react_baseline" if is_baseline else "react_fm"
     run_name = args.run_name or f"{mode}_epoch"
+
+    # Timestamp-based output directories
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    results_dir = f"{config['experiment']['results_dir']}/{timestamp}"
+    memory_dir = f"{config['memory']['persist_dir']}/{timestamp}" if not is_baseline else None
 
     # Logging: console (INFO) + file (DEBUG)
     setup_logging(
@@ -184,10 +202,29 @@ def main():
         max_steps=config["agent"]["max_steps"],
         max_memory_inject=config["agent"]["max_memory_inject"],
         enable_memory=not is_baseline,
+        inject_mode=args.inject_mode,
     )
 
+    # Determine which envs to run (for --only-memory-envs)
+    memory_env_ids: set[int] | None = None
+    if args.only_memory_envs and memory_store:
+        memory_env_ids = memory_store.get_env_ids()
+        logger.info(f"Only running {len(memory_env_ids)} envs with memory: {sorted(memory_env_ids)}")
+
     # Track per-env success across epochs (for skip-on-success)
-    env_success = [False] * (args.max_envs or 134)
+    # Stores task_type string if succeeded, None otherwise
+    env_success = [None] * (args.max_envs or 134)
+
+    # Load previous results to populate env_success
+    if args.resume_results:
+        with open(args.resume_results) as f:
+            prev_data = json.load(f)
+        for ep in prev_data.get("episodes", []):
+            idx = ep["env_idx"] - 1  # env_idx is 1-based
+            if 0 <= idx < len(env_success) and ep.get("success"):
+                env_success[idx] = ep.get("task_type", "unknown")
+        prev_success = sum(1 for s in env_success if s is not None)
+        logger.info(f"Loaded {prev_success} succeeded envs from {args.resume_results}")
 
     # Run epochs
     for epoch in range(1, num_epochs + 1):
@@ -215,7 +252,7 @@ def main():
 
                 # Load corresponding memory checkpoint
                 if memory_store:
-                    mem_ckpt = f"{config['memory']['persist_dir']}/epoch{epoch}_intermediate.json"
+                    mem_ckpt = f"{memory_dir}/epoch{epoch}_intermediate.json"
                     if Path(mem_ckpt).exists():
                         memory_store.load(mem_ckpt)
                         logger.info(f"Loaded memory checkpoint: {memory_store.size()} entries")
@@ -230,13 +267,21 @@ def main():
                     env_count += 1
                     continue
 
-                # Skip envs that succeeded in previous epochs
-                if epoch > 1 and env_success[env_count]:
+                # Skip envs without memory (for --only-memory-envs)
+                if memory_env_ids is not None and (env_count + 1) not in memory_env_ids:
+                    env.skip()
+                    env_count += 1
+                    if env_count >= max_envs:
+                        break
+                    continue
+
+                # Skip envs that succeeded in previous epochs (or loaded via --resume-results)
+                if (epoch > 1 or args.resume_results) and env_success[env_count] is not None:
                     env.skip()
                     # Record as skipped success
                     episode_results.append({
                         "env_idx": env_count + 1,
-                        "task_type": "",
+                        "task_type": env_success[env_count],
                         "task_description": "",
                         "success": True,
                         "total_steps": 0,
@@ -250,7 +295,7 @@ def main():
                     })
                     num_skipped += 1
                     env_count += 1
-                    logger.info(f"  [{env_count}] {'':8} SKIP (already succeeded)")
+                    logger.info(f"  [{env_count}] {env_success[env_count - 1]:<8} SKIP (already succeeded)")
                     if env_count >= max_envs:
                         break
                     continue
@@ -262,7 +307,7 @@ def main():
 
                 # Update success tracker
                 if result.success:
-                    env_success[env_count] = True
+                    env_success[env_count] = result.task_type
 
                 env_count += 1
 
@@ -283,7 +328,7 @@ def main():
                         f"{results_dir}/{run_name}{epoch}_intermediate.json"
                     )
                     if memory_store:
-                        memory_store.save(f"{config['memory']['persist_dir']}/epoch{epoch}_intermediate.json")
+                        memory_store.save(f"{memory_dir}/epoch{epoch}_intermediate.json")
 
                 if env_count >= max_envs:
                     break
@@ -311,7 +356,7 @@ def main():
 
         # Save memory
         if memory_store:
-            mem_path = f"{config['memory']['persist_dir']}/epoch{epoch}.json"
+            mem_path = f"{memory_dir}/epoch{epoch}.json"
             memory_store.save(mem_path)
             logger.info(f"Memory saved: {mem_path} ({memory_store.size()} entries)")
 
