@@ -75,6 +75,8 @@ class RollingTokenRateLimiterTests(unittest.TestCase):
             validate_llm_throttle_args(12000, 0)
         with self.assertRaisesRegex(ValueError, "prompt-history-window"):
             validate_llm_throttle_args(12000, 96, -1)
+        with self.assertRaisesRegex(ValueError, "loop-early-stop-cycles"):
+            validate_llm_throttle_args(12000, 96, 8, -1)
 
 
 if __name__ == "__main__":

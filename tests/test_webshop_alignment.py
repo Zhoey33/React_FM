@@ -161,6 +161,17 @@ class WebShopAlignmentTests(unittest.TestCase):
             [("click[old]", "old product"), ("click[new]", "new product")],
         )
 
+    def test_repeated_pattern_early_stop_detects_action_loops(self):
+        agent = WebShopReActAgent(llm=None, loop_early_stop_cycles=4)
+        loop = [
+            "search[salt]",
+            "click[item - salt]",
+            "click[back to search]",
+        ] * 4
+
+        self.assertEqual(agent._repeated_pattern_length(loop), 3)
+        self.assertIsNone(agent._repeated_pattern_length(loop[:-1]))
+
 
 if __name__ == "__main__":
     unittest.main()

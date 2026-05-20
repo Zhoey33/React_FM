@@ -68,6 +68,8 @@ def parse_args():
                         help="Max completion tokens for each WebShop action call")
     parser.add_argument("--prompt-history-window", type=int, default=0,
                         help="Keep only the latest N action/observation pairs in LLM prompts; 0 keeps full history")
+    parser.add_argument("--loop-early-stop-cycles", type=int, default=0,
+                        help="Stop failed episodes after a short action pattern repeats this many cycles; 0 disables")
     return parser.parse_args()
 
 
@@ -80,6 +82,7 @@ def validate_llm_throttle_args(
     llm_tpm_budget: int,
     agent_max_tokens: int,
     prompt_history_window: int = 0,
+    loop_early_stop_cycles: int = 0,
 ) -> None:
     """Validate WebShop LLM throttling CLI arguments."""
     if llm_tpm_budget < 0:
@@ -88,6 +91,8 @@ def validate_llm_throttle_args(
         raise ValueError("--agent-max-tokens must be a positive integer")
     if prompt_history_window < 0:
         raise ValueError("--prompt-history-window must be 0 or a positive integer")
+    if loop_early_stop_cycles < 0:
+        raise ValueError("--loop-early-stop-cycles must be 0 or a positive integer")
 
 
 def save_results(results: list[dict], summary: dict, filepath: str):
@@ -318,6 +323,7 @@ class WebShopReActAgent:
         cross_env: bool = False,
         allow_memory_updates: bool = True,
         prompt_history_window: int = 0,
+        loop_early_stop_cycles: int = 0,
     ):
         self.llm = llm
         self.memory = memory_store
@@ -332,12 +338,29 @@ class WebShopReActAgent:
         self.cross_env = cross_env
         self.allow_memory_updates = allow_memory_updates
         self.prompt_history_window = prompt_history_window
+        self.loop_early_stop_cycles = loop_early_stop_cycles
 
     def _prompt_history(self, history: list[tuple[str, str]]) -> list[tuple[str, str]]:
         """Return the history slice used in LLM prompts."""
         if self.prompt_history_window <= 0:
             return history
         return history[-self.prompt_history_window:]
+
+    def _repeated_pattern_length(self, actions: list[str]) -> int | None:
+        """Return repeated short-pattern length if recent actions are looping."""
+        cycles = self.loop_early_stop_cycles
+        if cycles <= 1:
+            return None
+        max_pattern = min(5, len(actions) // cycles)
+        for pattern_len in range(1, max_pattern + 1):
+            window = actions[-pattern_len * cycles:]
+            pattern = window[:pattern_len]
+            if pattern and all(
+                window[i:i + pattern_len] == pattern
+                for i in range(0, len(window), pattern_len)
+            ):
+                return pattern_len
+        return None
 
     def run_episode(self, env, env_idx: int = 0) -> dict:
         from prompts.webshop_prompts import build_user_prompt, SYSTEM_PROMPT_FM
@@ -451,6 +474,13 @@ class WebShopReActAgent:
 
             if is_done:
                 break
+            repeated_pattern_len = self._repeated_pattern_length(action_history)
+            if repeated_pattern_len is not None:
+                logger.info(
+                    "    Early stopping repeated action pattern "
+                    f"(length={repeated_pattern_len}, cycles={self.loop_early_stop_cycles})"
+                )
+                break
 
         # Post-episode memory extraction
         memories_stored = 0
@@ -559,6 +589,7 @@ def main():
         args.llm_tpm_budget,
         args.agent_max_tokens,
         args.prompt_history_window,
+        args.loop_early_stop_cycles,
     )
 
     with open(args.config) as f:
@@ -659,11 +690,13 @@ def main():
         cross_env=args.cross_env,
         allow_memory_updates=args.memory_setting == "online",
         prompt_history_window=args.prompt_history_window,
+        loop_early_stop_cycles=args.loop_early_stop_cycles,
     )
     run_metadata = {
         "llm_tpm_budget": args.llm_tpm_budget,
         "agent_max_tokens": agent_max_tokens,
         "prompt_history_window": args.prompt_history_window,
+        "loop_early_stop_cycles": args.loop_early_stop_cycles,
     }
 
     env_success: dict[int, float] = {}
