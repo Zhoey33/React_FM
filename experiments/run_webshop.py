@@ -7,6 +7,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import json
 import logging
+import re
 import sys
 import random
 import time
@@ -19,8 +20,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.llm import LLMClient, RollingTokenRateLimiter
-from src.memory import FailureMemoryStore
-from src.webshop_failure_detector import WebShopFailureDetector
+from src.memory import FailureMemoryStore, RetrievalResult
+from src.webshop_failure_detector import DetectionResult, WebShopFailureDetector
 from src.webshop_env import WebShopEnv
 from src.log_utils import setup_logging
 
@@ -70,6 +71,10 @@ def parse_args():
                         help="Keep only the latest N action/observation pairs in LLM prompts; 0 keeps full history")
     parser.add_argument("--loop-early-stop-cycles", type=int, default=0,
                         help="Stop failed episodes after a short action pattern repeats this many cycles; 0 disables")
+    parser.add_argument("--memory-injection-steps", type=int, default=3,
+                        help="Keep a retrieved/fallback WebShop memory hint in the next N prompts")
+    parser.add_argument("--memory-min-token-overlap", type=int, default=2,
+                        help="Minimum content-token overlap required to inject concrete WebShop memory")
     return parser.parse_args()
 
 
@@ -83,6 +88,8 @@ def validate_llm_throttle_args(
     agent_max_tokens: int,
     prompt_history_window: int = 0,
     loop_early_stop_cycles: int = 0,
+    memory_injection_steps: int = 1,
+    memory_min_token_overlap: int = 0,
 ) -> None:
     """Validate WebShop LLM throttling CLI arguments."""
     if llm_tpm_budget < 0:
@@ -93,6 +100,10 @@ def validate_llm_throttle_args(
         raise ValueError("--prompt-history-window must be 0 or a positive integer")
     if loop_early_stop_cycles < 0:
         raise ValueError("--loop-early-stop-cycles must be 0 or a positive integer")
+    if memory_injection_steps <= 0:
+        raise ValueError("--memory-injection-steps must be a positive integer")
+    if memory_min_token_overlap < 0:
+        raise ValueError("--memory-min-token-overlap must be 0 or a positive integer")
 
 
 def save_results(results: list[dict], summary: dict, filepath: str):
@@ -308,6 +319,25 @@ def log_summary(summary: dict):
 class WebShopReActAgent:
     """ReAct agent for WebShop."""
 
+    MEMORY_RETRIEVAL_FAILURE_TYPES = {
+        "no_results",
+        "invalid_action",
+        "action_loop",
+        "unproductive",
+    }
+    FALLBACK_MEMORY_HINT = (
+        "No reliable past memory matched this failure. Try a different "
+        "search/item strategy, avoid repeating the same search-item-back loop, "
+        "inspect a different product, choose untried relevant options, or buy "
+        "now if the current product satisfies the instruction."
+    )
+    TOKEN_STOPWORDS = {
+        "action", "also", "and", "are", "back", "buy", "click", "dollar",
+        "dollars", "for", "from", "have", "instruction", "item", "looking",
+        "lower", "need", "now", "price", "search", "than", "that", "the",
+        "this", "want", "with", "would", "you",
+    }
+
     def __init__(
         self,
         llm: LLMClient,
@@ -324,6 +354,8 @@ class WebShopReActAgent:
         allow_memory_updates: bool = True,
         prompt_history_window: int = 0,
         loop_early_stop_cycles: int = 0,
+        memory_injection_steps: int = 3,
+        memory_min_token_overlap: int = 2,
     ):
         self.llm = llm
         self.memory = memory_store
@@ -339,6 +371,8 @@ class WebShopReActAgent:
         self.allow_memory_updates = allow_memory_updates
         self.prompt_history_window = prompt_history_window
         self.loop_early_stop_cycles = loop_early_stop_cycles
+        self.memory_injection_steps = memory_injection_steps
+        self.memory_min_token_overlap = memory_min_token_overlap
 
     def _prompt_history(self, history: list[tuple[str, str]]) -> list[tuple[str, str]]:
         """Return the history slice used in LLM prompts."""
@@ -362,6 +396,84 @@ class WebShopReActAgent:
                 return pattern_len
         return None
 
+    @staticmethod
+    def _memory_failure_signature(det: DetectionResult, action: str) -> str:
+        """Return an episode-local key for deduplicating memory retrievals."""
+        normalized_action = " ".join(action.strip().lower().split())
+        return f"{det.failure_type}|{normalized_action}"
+
+    def _should_retrieve_memory(
+        self,
+        det: DetectionResult,
+        action: str,
+        retrieved_signatures: set[str],
+    ) -> bool:
+        """Return whether a detected WebShop failure should query shared memory."""
+        if not det.is_failure:
+            return False
+        if det.failure_type not in self.MEMORY_RETRIEVAL_FAILURE_TYPES:
+            return False
+        return self._memory_failure_signature(det, action) not in retrieved_signatures
+
+    @classmethod
+    def _content_tokens(cls, text: str) -> set[str]:
+        """Return normalized content tokens for lightweight memory relevance checks."""
+        tokens = set()
+        for raw in re.findall(r"[a-zA-Z0-9]+", text.lower()):
+            if len(raw) < 3 or raw in cls.TOKEN_STOPWORDS:
+                continue
+            if len(raw) > 3 and raw.endswith("s"):
+                raw = raw[:-1]
+            tokens.add(raw)
+        return tokens
+
+    @staticmethod
+    def _instruction_text(observation: str) -> str:
+        """Extract the shopping instruction from a WebShop observation."""
+        lines = observation.splitlines()
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped.lower().startswith("instruction"):
+                continue
+            inline = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
+            if inline:
+                return inline
+            for next_line in lines[idx + 1:]:
+                candidate = next_line.strip()
+                if candidate:
+                    return candidate
+        return observation[:300]
+
+    def _memory_token_overlap(
+        self,
+        query_action: str,
+        query_observation: str,
+        entry,
+    ) -> int:
+        """Return lexical overlap between the current failure and a memory entry."""
+        query_tokens = self._content_tokens(
+            f"{query_action} {self._instruction_text(query_observation)}"
+        )
+        memory_tokens = self._content_tokens(
+            f"{entry.failure_action} {entry.failure_observation} {entry.solution_action}"
+        )
+        return len(query_tokens & memory_tokens)
+
+    def _select_reliable_memories(
+        self,
+        retrieval,
+        query_action: str,
+        query_observation: str,
+    ) -> list:
+        """Filter retrieved memories to entries with task-specific lexical overlap."""
+        entries = retrieval.entries if isinstance(retrieval, RetrievalResult) else list(retrieval)
+        reliable = []
+        for entry in entries:
+            overlap = self._memory_token_overlap(query_action, query_observation, entry)
+            if overlap >= self.memory_min_token_overlap:
+                reliable.append(entry)
+        return reliable
+
     def run_episode(self, env, env_idx: int = 0) -> dict:
         from prompts.webshop_prompts import build_user_prompt, SYSTEM_PROMPT_FM
         from src.webshop_memory_extractor import extract_failure_recoveries
@@ -382,8 +494,11 @@ class WebShopReActAgent:
         final_reward = 0.0
 
         current_retrieved = None
+        current_hint = None
+        memory_steps_remaining = 0
         failures_detected = 0
         memories_retrieved_total = 0
+        retrieved_failure_signatures: set[str] = set()
 
         episode_memories = None
         if self.enable_memory and self.inject_mode == "episode":
@@ -398,6 +513,9 @@ class WebShopReActAgent:
 
         for step_num in range(self.max_steps):
             prompt_history = self._prompt_history(history)
+            memory_was_active = memory_steps_remaining > 0
+            active_retrieved = current_retrieved if memory_was_active else None
+            active_hint = current_hint if memory_was_active else None
             if self.inject_mode == "episode":
                 prompt = build_user_prompt(
                     task_type=task_type, task_obs=init_obs, history=prompt_history,
@@ -407,7 +525,8 @@ class WebShopReActAgent:
             else:
                 prompt = build_user_prompt(
                     task_type=task_type, task_obs=init_obs, history=prompt_history,
-                    retrieved_memories=current_retrieved, memory_style=self.memory_style,
+                    retrieved_memories=active_retrieved, memory_style=self.memory_style,
+                    hint_text=active_hint,
                     valid_actions=valid_actions,
                 )
 
@@ -416,9 +535,6 @@ class WebShopReActAgent:
                 system=SYSTEM_PROMPT_FM,
             )
             action = response.strip().split("\n")[0].strip()
-
-            if self.inject_mode == "in_loop":
-                current_retrieved = None
 
             if action.startswith("> "):
                 action = action[2:]
@@ -458,19 +574,49 @@ class WebShopReActAgent:
                     failures_detected += 1
                     logger.info(f"    FAILURE detected: {det.failure_type}")
 
-                    if self.inject_mode == "in_loop":
-                        retrieved = self.memory.retrieve(
+                    if (
+                        self.inject_mode == "in_loop"
+                        and memory_steps_remaining <= 0
+                        and self._should_retrieve_memory(
+                            det, action, retrieved_failure_signatures
+                        )
+                    ):
+                        retrieved_failure_signatures.add(
+                            self._memory_failure_signature(det, action)
+                        )
+                        retrieval = self.memory.retrieve(
                             query_action=action, query_observation=observation,
                             task_type=task_type, top_k=self.max_memory_inject,
                             env_idx=env_idx, cross_env=self.cross_env,
+                            return_scores=True,
+                        )
+                        retrieved = self._select_reliable_memories(
+                            retrieval, action, observation
                         )
                         record["memory_retrieved"] = len(retrieved)
                         memories_retrieved_total += len(retrieved)
+                        memory_steps_remaining = self.memory_injection_steps
                         if retrieved:
                             current_retrieved = retrieved
+                            current_hint = None
+                        else:
+                            current_retrieved = None
+                            current_hint = self.FALLBACK_MEMORY_HINT
+                    elif self.inject_mode == "in_loop":
+                        logger.debug(
+                            "    Memory retrieval skipped for failure_type=%s action=%s",
+                            det.failure_type,
+                            action[:80],
+                        )
 
             steps.append(record)
             history.append((action, observation))
+
+            if self.inject_mode == "in_loop" and memory_was_active:
+                memory_steps_remaining -= 1
+                if memory_steps_remaining <= 0:
+                    current_retrieved = None
+                    current_hint = None
 
             if is_done:
                 break
@@ -590,6 +736,8 @@ def main():
         args.agent_max_tokens,
         args.prompt_history_window,
         args.loop_early_stop_cycles,
+        args.memory_injection_steps,
+        args.memory_min_token_overlap,
     )
 
     with open(args.config) as f:
@@ -691,12 +839,16 @@ def main():
         allow_memory_updates=args.memory_setting == "online",
         prompt_history_window=args.prompt_history_window,
         loop_early_stop_cycles=args.loop_early_stop_cycles,
+        memory_injection_steps=args.memory_injection_steps,
+        memory_min_token_overlap=args.memory_min_token_overlap,
     )
     run_metadata = {
         "llm_tpm_budget": args.llm_tpm_budget,
         "agent_max_tokens": agent_max_tokens,
         "prompt_history_window": args.prompt_history_window,
         "loop_early_stop_cycles": args.loop_early_stop_cycles,
+        "memory_injection_steps": args.memory_injection_steps,
+        "memory_min_token_overlap": args.memory_min_token_overlap,
     }
 
     env_success: dict[int, float] = {}
