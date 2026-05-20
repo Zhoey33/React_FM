@@ -66,6 +66,8 @@ def parse_args():
                         help="Shared LLM token-per-minute budget across agent/judge/extractor; 0 disables")
     parser.add_argument("--agent-max-tokens", type=int, default=96,
                         help="Max completion tokens for each WebShop action call")
+    parser.add_argument("--prompt-history-window", type=int, default=0,
+                        help="Keep only the latest N action/observation pairs in LLM prompts; 0 keeps full history")
     return parser.parse_args()
 
 
@@ -74,12 +76,18 @@ def set_seed(seed: int):
     np.random.seed(seed)
 
 
-def validate_llm_throttle_args(llm_tpm_budget: int, agent_max_tokens: int) -> None:
+def validate_llm_throttle_args(
+    llm_tpm_budget: int,
+    agent_max_tokens: int,
+    prompt_history_window: int = 0,
+) -> None:
     """Validate WebShop LLM throttling CLI arguments."""
     if llm_tpm_budget < 0:
         raise ValueError("--llm-tpm-budget must be 0 or a positive integer")
     if agent_max_tokens <= 0:
         raise ValueError("--agent-max-tokens must be a positive integer")
+    if prompt_history_window < 0:
+        raise ValueError("--prompt-history-window must be 0 or a positive integer")
 
 
 def save_results(results: list[dict], summary: dict, filepath: str):
@@ -309,6 +317,7 @@ class WebShopReActAgent:
         memory_format: str = "failure_recovery",
         cross_env: bool = False,
         allow_memory_updates: bool = True,
+        prompt_history_window: int = 0,
     ):
         self.llm = llm
         self.memory = memory_store
@@ -322,6 +331,13 @@ class WebShopReActAgent:
         self.memory_format = memory_format
         self.cross_env = cross_env
         self.allow_memory_updates = allow_memory_updates
+        self.prompt_history_window = prompt_history_window
+
+    def _prompt_history(self, history: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Return the history slice used in LLM prompts."""
+        if self.prompt_history_window <= 0:
+            return history
+        return history[-self.prompt_history_window:]
 
     def run_episode(self, env, env_idx: int = 0) -> dict:
         from prompts.webshop_prompts import build_user_prompt, SYSTEM_PROMPT_FM
@@ -358,15 +374,16 @@ class WebShopReActAgent:
                 memories_retrieved_total = len(episode_memories)
 
         for step_num in range(self.max_steps):
+            prompt_history = self._prompt_history(history)
             if self.inject_mode == "episode":
                 prompt = build_user_prompt(
-                    task_type=task_type, task_obs=init_obs, history=history,
+                    task_type=task_type, task_obs=init_obs, history=prompt_history,
                     retrieved_memories=episode_memories, memory_style=self.memory_style,
                     valid_actions=valid_actions,
                 )
             else:
                 prompt = build_user_prompt(
-                    task_type=task_type, task_obs=init_obs, history=history,
+                    task_type=task_type, task_obs=init_obs, history=prompt_history,
                     retrieved_memories=current_retrieved, memory_style=self.memory_style,
                     valid_actions=valid_actions,
                 )
@@ -538,7 +555,11 @@ class WebShopReActAgent:
 
 def main():
     args = parse_args()
-    validate_llm_throttle_args(args.llm_tpm_budget, args.agent_max_tokens)
+    validate_llm_throttle_args(
+        args.llm_tpm_budget,
+        args.agent_max_tokens,
+        args.prompt_history_window,
+    )
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
@@ -637,10 +658,12 @@ def main():
         memory_format=args.memory_format,
         cross_env=args.cross_env,
         allow_memory_updates=args.memory_setting == "online",
+        prompt_history_window=args.prompt_history_window,
     )
     run_metadata = {
         "llm_tpm_budget": args.llm_tpm_budget,
         "agent_max_tokens": agent_max_tokens,
+        "prompt_history_window": args.prompt_history_window,
     }
 
     env_success: dict[int, float] = {}

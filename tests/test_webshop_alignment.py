@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from src.memory import FailureMemoryStore
 from experiments.run_webshop import (
+    WebShopReActAgent,
     compute_summary,
     make_error_episode_result,
     load_memory_for_setting,
@@ -146,6 +147,19 @@ class WebShopAlignmentTests(unittest.TestCase):
 
         self.assertLess(prompt.index("Search results page"), prompt.index("Choose exactly one valid action"))
         self.assertLess(prompt.index("click[next >]"), prompt.rindex("> "))
+
+    def test_prompt_history_window_keeps_latest_steps_only(self):
+        agent = WebShopReActAgent(llm=None, prompt_history_window=2)
+        history = [
+            ("search[first]", "first results"),
+            ("click[old]", "old product"),
+            ("click[new]", "new product"),
+        ]
+
+        self.assertEqual(
+            agent._prompt_history(history),
+            [("click[old]", "old product"), ("click[new]", "new product")],
+        )
 
 
 if __name__ == "__main__":

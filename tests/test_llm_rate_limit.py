@@ -73,6 +73,8 @@ class RollingTokenRateLimiterTests(unittest.TestCase):
             validate_llm_throttle_args(-1, 96)
         with self.assertRaisesRegex(ValueError, "agent-max-tokens"):
             validate_llm_throttle_args(12000, 0)
+        with self.assertRaisesRegex(ValueError, "prompt-history-window"):
+            validate_llm_throttle_args(12000, 96, -1)
 
 
 if __name__ == "__main__":
