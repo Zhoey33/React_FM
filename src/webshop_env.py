@@ -1,4 +1,4 @@
-"""WebShop environment wrapper — subprocess bridge to conda webshop env.
+"""WebShop environment wrapper for paper-aligned subprocess execution.
 
 WebShop requires Python 3.10 with incompatible dependencies, so we run it
 in a separate conda environment and communicate via subprocess + JSON.
@@ -9,6 +9,8 @@ import logging
 import subprocess
 import sys
 import os
+import selectors
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -25,13 +27,21 @@ class WebShopEnv:
 
     def __init__(
         self,
-        num_products: int = 1000,
-        observation_mode: str = "text",
+        num_products: int | None = None,
+        observation_mode: str = "text_rich",
         max_sessions: int = 500,
+        human_goals: int = 1,
+        split: str = "test",
+        step_limit: int = 100,
+        wrapper: str = "official",
     ):
         self.num_products = num_products
         self.observation_mode = observation_mode
         self.max_sessions = max_sessions
+        self.human_goals = human_goals
+        self.split = split
+        self.step_limit = step_limit
+        self.wrapper = wrapper
         self._proc = None
         self._env_idx = 0
         self._current_instruction = ""
@@ -46,8 +56,12 @@ class WebShopEnv:
             [
                 WEBSHOP_PYTHON,
                 str(_BRIDGE_SCRIPT),
-                "--num-products", str(self.num_products),
+                "--num-products", "full" if self.num_products is None else str(self.num_products),
                 "--observation-mode", self.observation_mode,
+                "--human-goals", str(self.human_goals),
+                "--split", self.split,
+                "--step-limit", str(self.step_limit),
+                "--wrapper", self.wrapper,
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -57,18 +71,36 @@ class WebShopEnv:
             cwd=str(Path(__file__).parent.parent),
         )
 
-        # Wait for ready signal (skip non-READY lines)
-        while True:
-            line = self._proc.stdout.readline()
-            if not line:
-                rc = self._proc.poll()
-                raise RuntimeError(f"WebShop bridge failed to start (rc={rc})")
-            line = line.strip()
-            if line == "READY":
+        # Wait for ready signal (skip non-READY lines) and surface bridge errors.
+        selector = selectors.DefaultSelector()
+        selector.register(self._proc.stdout, selectors.EVENT_READ)
+        selector.register(self._proc.stderr, selectors.EVENT_READ)
+        stderr_lines: list[str] = []
+        start = time.time()
+        while time.time() - start < 300:
+            events = selector.select(timeout=0.2)
+            if not events and self._proc.poll() is not None:
                 break
-            # Skip other output lines during startup
+            for key, _ in events:
+                line = key.fileobj.readline()
+                if not line:
+                    continue
+                line = line.strip()
+                if key.fileobj is self._proc.stdout:
+                    if line == "READY":
+                        logger.info(
+                            f"WebShop bridge started (products={self.num_products or 'full'}, "
+                            f"split={self.split}, wrapper={self.wrapper})"
+                        )
+                        return
+                elif line:
+                    stderr_lines.append(line)
+                    logger.debug(f"WebShop bridge stderr: {line[:200]}")
 
-        logger.info(f"WebShop bridge started (products={self.num_products})")
+        err = "\n".join(stderr_lines[-20:])
+        if self._proc.poll() is not None:
+            raise RuntimeError(f"WebShop bridge failed to start (rc={self._proc.returncode})\n{err}")
+        raise TimeoutError(f"Timed out waiting for WebShop bridge READY.\n{err}")
 
     def _send_command(self, cmd: dict) -> dict:
         """Send command to bridge and get response."""
@@ -84,11 +116,14 @@ class WebShopEnv:
             if not line:
                 continue
             try:
-                return json.loads(line)
+                response = json.loads(line)
             except json.JSONDecodeError:
                 # Skip non-JSON output (warnings, etc.)
                 logger.debug(f"Bridge non-JSON: {line[:100]}")
                 continue
+            if "error" in response:
+                raise RuntimeError(f"WebShop bridge error: {response['error']}")
+            return response
 
     def reset(self, session_idx: int | None = None) -> tuple[str, str, dict]:
         """Reset to a new shopping session.
@@ -113,6 +148,7 @@ class WebShopEnv:
             "session_idx": idx,
             "instruction": instruction,
             "available_actions": resp.get("actions", {}),
+            "goal": resp.get("goal", ""),
         }
 
         logger.info(f"Env #{self._env_idx}: session={idx}, instruction={instruction[:80]}")
@@ -124,6 +160,7 @@ class WebShopEnv:
 
         info = {
             "available_actions": resp.get("actions", {}),
+            "raw_info": resp.get("raw_info", {}),
         }
 
         return resp["observation"], float(resp["reward"]), bool(resp["done"]), info

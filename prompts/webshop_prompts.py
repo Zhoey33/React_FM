@@ -1,4 +1,4 @@
-"""WebShop prompts — system/user split, memory injection."""
+"""WebShop prompts for action-only agents with optional memory injection."""
 
 SYSTEM_PROMPT_BASE = """You are an online shopping agent. Each turn, output ONLY one action. No explanations.
 
@@ -38,6 +38,7 @@ def build_user_prompt(
     retrieved_memories: list | None = None,
     memory_style: str = "original",
     hint_text: str | None = None,
+    valid_actions: list[str] | None = None,
 ) -> str:
     """Build user prompt for WebShop."""
     sections = [FEWSHOT_EXAMPLE]
@@ -85,6 +86,14 @@ def build_user_prompt(
 
     for action, obs in history:
         prompt += format_step(action, obs)
+
+    if valid_actions:
+        action_lines = "\n".join(f"- {action}" for action in valid_actions)
+        prompt += (
+            "\nChoose exactly one valid action from this list and output only that action.\n"
+            + action_lines
+            + "\n"
+        )
 
     if hint_text:
         prompt += f"\n{hint_text}\n"

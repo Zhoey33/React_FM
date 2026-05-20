@@ -212,6 +212,8 @@ Online memory 完成后，再实现 frozen test-time memory 设置：
 - Test 期间不写入新 memory。
 - 第一版 offline memory 从官方 train split 中固定抽取 100 条 instructions 生成。
 - Memory 也可以来自后续扩展的 train/dev 预先固定 memory 文件。
+- Frozen 设置下 memory 仍然是 WebShop 内共享的一套 `shopping` memory，不按 `env_idx` 隔离。
+- Offline memory 文件必须使用共享粒度保存，例如 `scope="task_type"` 且 `task_type="shopping"`。
 - Test 期间只读 memory，不更新 memory。
 - 该设置避免 test leakage，更适合与原论文 baseline 对比。
 
@@ -222,16 +224,70 @@ Online memory 完成后，再实现 frozen test-time memory 设置：
 - 当前 100 条 test 子集用于快速真实实验，不应直接等同于原论文 500-test 完整结果。
 - 使用 `reward >= 0.5` 的运行只能视为 relaxed internal metric，不是 WebShop 原论文 SR。
 
+## 当前环境阻塞记录
+
+- 2026-05-20 本地 `/Users/zhoey/WebShop` 仍缺少 full WebShop 数据与完整搜索索引：
+  - `/Users/zhoey/WebShop/data/items_shuffle.json`
+  - `/Users/zhoey/WebShop/data/items_ins_v2.json`
+  - `/Users/zhoey/WebShop/search_engine/indexes`
+- 当前网络环境下载不稳定：
+  - Google Drive 官方 `gdown` 下载 `items_shuffle.json` 时在约 398 MB 处断线。
+  - Hugging Face 镜像在当前网络下连接超时或卡在大文件握手阶段。
+- 等网络较快时，优先直接使用 WebShop 官方 Google Drive 链接下载 full 数据：
+  - `cd /Users/zhoey/WebShop/data`
+  - `/opt/miniconda3/envs/webshop/bin/python -m gdown --continue 'https://drive.google.com/uc?id=1A2whVgOO0euk5O13n2iYDM0bQRkkRduB' -O items_shuffle.json`
+  - `/opt/miniconda3/envs/webshop/bin/python -m gdown --continue 'https://drive.google.com/uc?id=1s2j6NgHljiZzQNL3veZaAiyW_qDEgBNi' -O items_ins_v2.json`
+  - `cd /Users/zhoey/WebShop/search_engine && /opt/miniconda3/envs/webshop/bin/python convert_product_file_format.py && ./run_indexing.sh`
+- full 数据和 `indexes` 建好前，React-FM 的 WebShop paper-aligned 100-test 结果不要启动；只能使用 1000-product preview 做环境 smoke test。
+
 ## TODO List
 
-- [ ] 安装并验证 full WebShop 数据文件与完整搜索索引。
-- [ ] 修改 WebShop bridge / runner，使其使用 `human_goals=1`。
-- [ ] 复用官方 `baseline_models/env.py::WebEnv` wrapper。
-- [ ] 实现官方 test split 中固定抽取 100 条的采样逻辑，并保存采样 ID 列表。
-- [ ] 实现官方 train split 中固定抽取 100 条的 offline memory 收集逻辑，并保存采样 ID 列表。
-- [ ] 将 WebShop success 统一改为 `reward == 1.0`。
-- [ ] 在 summary 中同时保存 `avg_reward` 和 `task_score = 100 * avg_reward`。
-- [ ] 将 WebShop 主实验 step limit 统一为 100。
-- [ ] 将 online memory 设置为共享 `shopping` memory，不按 `env_idx` 隔离。
-- [ ] 实现 frozen test-time memory：test 期间只读 memory，不写入新 memory。
-- [ ] 在结果文件中明确记录 memory setting：`online` 或 `frozen`。
+### 实现与环境 TODO
+
+- [ ] 安装并验证 full WebShop 数据文件与完整搜索索引。  
+  状态：未完成；当前受网络环境阻塞，缺少 `items_shuffle.json`、`items_ins_v2.json` 和完整 `search_engine/indexes`。
+- [x] 修改 WebShop bridge / runner，使其使用 `human_goals=1`。  
+  状态：已完成；`experiments/webshop_bridge.py` 和 `src/webshop_env.py` 已支持并默认使用 human goals。
+- [x] 复用官方 `baseline_models/env.py::WebEnv` wrapper。  
+  状态：已完成；WebShop bridge 默认使用 `--wrapper official`，并保留 `--webshop-wrapper direct` 作为 legacy/smoke fallback。
+- [x] 实现官方 test split 中固定抽取 100 条的采样逻辑，并保存采样 ID 列表。  
+  状态：已完成；`experiments/run_webshop.py` 支持 `--eval-split test --eval-sample-size 100 --eval-sample-seed 42`，并保存 `*_sample_ids.json`。
+- [ ] 实现官方 train split 中固定抽取 100 条的 offline memory 收集逻辑，并保存采样 ID 列表。  
+  状态：部分完成；runner 已支持 train split offset 采样，但还没有单独实现“从 train split 生成 frozen offline memory”的收集流程。生成的 offline memory 必须按共享 `shopping` memory 保存，不按 `env_idx` 隔离。
+- [x] 将 WebShop success 统一改为 `reward == 1.0`。  
+  状态：已完成；summary、episode result、resume skip 逻辑均使用 exact success。
+- [x] 在 summary 中同时保存 `avg_reward` 和 `task_score = 100 * avg_reward`。  
+  状态：已完成；summary 已新增 `task_score`。
+- [x] 将 WebShop 主实验 step limit 统一为 100。  
+  状态：已完成；runner 默认 `--max-steps 100`，bridge official wrapper 使用同一 `step_limit`。
+- [x] 将 online memory 设置为共享 `shopping` memory，不按 `env_idx` 隔离。  
+  状态：已完成；online memory 使用 `FailureMemoryStore(scope="task_type")`，WebShop task type 固定为 `shopping`。
+- [ ] 实现 frozen test-time memory：test 期间只读 memory，不写入新 memory。  
+  状态：部分完成；runner 已支持 `--memory-setting frozen` 并禁止 test-time 写入，但 frozen 所需 offline memory 生成流程尚未完成。Frozen test-time memory 应加载共享 `shopping` memory。
+- [x] 在结果文件中明确记录 memory setting：`online` 或 `frozen`。  
+  状态：已完成；summary 已记录 `memory_setting`。
+
+### 实验运行 TODO
+
+- [x] WebShop official wrapper smoke test：1000-product preview，`human_goals=1`，`max_steps=3`，验证 reset/valid actions/step reward。  
+  状态：已完成过一次本地 smoke；输出显示 official wrapper 能返回 human instruction、valid actions，reward 已按 0-1 归一。若后续改 bridge，需重跑。
+- [ ] Paper-aligned WebShop 环境 smoke test：full products + full index，`human_goals=1`，official test split，运行 1 条 episode。  
+  状态：未完成；依赖 full 数据和完整索引。
+- [ ] React-FM online memory 主实验：official test split 固定抽取 100 条，`memory_setting=online`，`max_steps=100`，使用共享 `shopping` memory。  
+  状态：未完成；依赖 full 数据和完整索引。建议命令：
+  `python experiments/run_webshop.py --config config.yaml --max-envs 100 --eval-split test --eval-sample-size 100 --eval-sample-seed 42 --memory-setting online --num-products full --max-steps 100 --run-name ws_react_fm_online_aligned_`
+- [ ] 保存并检查 online 100-test 采样列表。  
+  状态：未完成；主实验完成后检查 `*_sample_ids.json` 是否为 100 个唯一 test IDs，且 summary 记录 `eval_sample_seed=42`。
+- [ ] 分析 React-FM online 100-test 结果。  
+  状态：未完成；需要检查 `avg_reward`、`task_score`、`success_rate`、`memory_stats`、失败 episode 分布，并明确标注 online/transductive setting。
+- [ ] 生成 frozen offline memory：从 official train split 固定抽取 100 条，运行 memory 收集流程并保存 memory 文件与 train sample IDs。  
+  状态：未完成；需要先实现/确认 offline memory 收集脚本或 runner 模式。offline memory 必须是一套共享 `shopping` memory，例如保存为 `scope="task_type"` / `task_type="shopping"`，不能按 train `env_idx` 隔离。
+- [ ] React-FM frozen test-time memory 实验：official test split 固定抽取 100 条，加载 offline memory，`memory_setting=frozen`，test 期间不写 memory。  
+  状态：未完成；依赖 offline memory 文件。建议命令形态：
+  `python experiments/run_webshop.py --config config.yaml --max-envs 100 --eval-split test --eval-sample-size 100 --eval-sample-seed 42 --memory-setting frozen --resume-memory <offline_memory.json> --num-products full --max-steps 100 --run-name ws_react_fm_frozen_aligned_`
+- [ ] 对比 online vs frozen 100-test 结果。  
+  状态：未完成；比较 `task_score`、exact `success_rate`、token 开销和 memory 检索命中。
+- [ ] 扩展完整 paper-aligned 500-test React-FM 评估。  
+  状态：未完成；100-test 结果稳定后运行 official test split 全 500 条，并保存完整结果。
+- [ ] 可选 baseline 对照：运行 vanilla ReAct official 100-test。  
+  状态：未完成；用于判断 React-FM 增益，建议与 React-FM 使用同一 `*_sample_ids.json`。

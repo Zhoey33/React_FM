@@ -1,4 +1,4 @@
-"""Run React_FM (or baseline ReAct) on WebShop."""
+"""Run paper-aligned React_FM (or baseline ReAct) on WebShop."""
 
 import os
 os.environ["HF_HUB_OFFLINE"] = "1"
@@ -10,6 +10,7 @@ import logging
 import sys
 import random
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import yaml
@@ -44,8 +45,23 @@ def parse_args():
                         default="hybrid", help="Retrieval method for ablation")
     parser.add_argument("--cross-env", action="store_true",
                         help="Enable cross-env memory sharing (retrieve from all envs)")
-    parser.add_argument("--num-products", type=int, default=1000, help="Number of products")
-    parser.add_argument("--max-steps", type=int, default=15, help="Max steps per episode")
+    parser.add_argument("--num-products", type=str, default="full",
+                        help="Product count: 'full' for paper-aligned full WebShop, or preview sizes such as 1000")
+    parser.add_argument("--max-steps", type=int, default=100, help="Max steps per episode")
+    parser.add_argument("--eval-split", choices=["test", "eval", "train"], default="test")
+    parser.add_argument("--eval-sample-size", type=int, default=100,
+                        help="Fixed subset size from the official split")
+    parser.add_argument("--eval-sample-seed", type=int, default=42,
+                        help="Seed for the fixed official-split subset")
+    parser.add_argument("--memory-setting", choices=["online", "frozen"], default="online",
+                        help="Online writes test-time memory; frozen is read-only during test")
+    parser.add_argument("--human-goals", type=int, default=1, help="Use crowd-sourced human instructions")
+    parser.add_argument("--observation-mode", choices=["html", "text", "text_rich", "url"], default="text_rich",
+                        help="WebShop observation mode; official baseline uses text_rich")
+    parser.add_argument("--webshop-wrapper", choices=["official", "direct"], default="official",
+                        help="Use official WebShop wrapper/valid-action interface or legacy direct text env")
+    parser.add_argument("--sample-ids", type=str, default=None,
+                        help="Optional JSON list of official split session IDs to run")
     return parser.parse_args()
 
 
@@ -61,12 +77,134 @@ def save_results(results: list[dict], summary: dict, filepath: str):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def compute_summary(results: list[dict], memory_stats: dict, mode: str) -> dict:
+def parse_num_products(value: str) -> int | None:
+    """Parse product-count values, where None means full WebShop."""
+    lowered = str(value).lower()
+    if lowered in {"full", "all", "none", "null"}:
+        return None
+    return int(value)
+
+
+def memory_scope_for_setting(memory_setting: str) -> str:
+    """Return WebShop memory scope; both online and frozen share shopping memory."""
+    if memory_setting not in {"online", "frozen"}:
+        raise ValueError(f"Unsupported memory setting: {memory_setting}")
+    return "task_type"
+
+
+def load_memory_for_setting(
+    memory_store: FailureMemoryStore,
+    memory_path: str,
+    memory_setting: str,
+) -> None:
+    """Load WebShop memory and reject non-shared legacy scopes."""
+    validate_memory_requirements(memory_setting, memory_path)
+    expected_scope = memory_scope_for_setting(memory_setting)
+    memory_store.load(memory_path)
+    if memory_store.scope != expected_scope:
+        raise ValueError(
+            "WebShop memory must use shared task_type scope "
+            f"for {memory_setting}; got scope={memory_store.scope!r} from {memory_path}"
+        )
+    bucket_keys = memory_store.get_env_ids()
+    if memory_store.size() > 0 and "shopping" not in bucket_keys:
+        raise ValueError(
+            "WebShop memory must be stored under task_type='shopping'; "
+            f"got buckets={sorted(bucket_keys)} from {memory_path}"
+        )
+    if memory_setting == "frozen" and memory_store.size() == 0:
+        raise ValueError(
+            "Frozen WebShop memory must be non-empty; "
+            f"loaded 0 entries from {memory_path}"
+        )
+
+
+def validate_memory_requirements(memory_setting: str, memory_path: str | None) -> None:
+    """Validate memory-file requirements for WebShop memory settings."""
+    if memory_setting != "frozen":
+        return
+    if not memory_path:
+        raise ValueError("Frozen WebShop runs require --resume-memory with offline shopping memory")
+    if not Path(memory_path).exists():
+        raise FileNotFoundError(f"Frozen WebShop resume-memory file is missing: {memory_path}")
+
+
+def sample_session_ids(total: int, sample_size: int, seed: int) -> list[int]:
+    """Sample a deterministic official-split subset without replacement."""
+    if sample_size > total:
+        raise ValueError(f"sample_size={sample_size} exceeds split size {total}")
+    rng = random.Random(seed)
+    return rng.sample(range(total), sample_size)
+
+
+def official_split_session_ids(split: str) -> list[int]:
+    """Return official WebShop shuffled-goal indices for a split."""
+    if split == "test":
+        return list(range(500))
+    if split == "eval":
+        return list(range(500, 1500))
+    if split == "train":
+        return list(range(1500, 12087))
+    raise ValueError(f"Unsupported WebShop split: {split}")
+
+
+def validate_session_ids(session_ids: list[int], split: str) -> None:
+    """Validate user-provided WebShop session IDs against the requested split."""
+    if len(set(session_ids)) != len(session_ids):
+        raise ValueError("Duplicate WebShop session IDs are not allowed")
+    allowed = set(official_split_session_ids(split))
+    outside = [idx for idx in session_ids if idx not in allowed]
+    if outside:
+        preview = outside[:10]
+        raise ValueError(
+            f"Sample IDs outside official {split} split: {preview}"
+        )
+
+
+def load_or_sample_session_ids(
+    sample_ids_path: str | None,
+    split: str,
+    sample_size: int,
+    seed: int,
+) -> list[int]:
+    """Load session IDs from JSON or sample from the official WebShop split."""
+    if sample_ids_path:
+        with open(sample_ids_path) as f:
+            ids = json.load(f)
+        if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+            raise ValueError(f"Sample ID file must be a JSON list of ints: {sample_ids_path}")
+        validate_session_ids(ids, split)
+        return ids
+
+    candidates = official_split_session_ids(split)
+    sampled_offsets = sample_session_ids(len(candidates), sample_size, seed)
+    ids = [candidates[offset] for offset in sampled_offsets]
+    validate_session_ids(ids, split)
+    return ids
+
+
+def save_sample_ids(session_ids: Sequence[int], filepath: str):
+    """Save the fixed WebShop session list for reproducibility."""
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, "w") as f:
+        json.dump(list(session_ids), f, indent=2)
+
+
+def is_exact_success(reward: float) -> bool:
+    """Return paper-aligned WebShop success: reward must be exactly 1.0."""
+    return reward == 1.0
+
+
+def compute_summary(
+    results: list[dict],
+    memory_stats: dict,
+    mode: str,
+    memory_setting: str = "online",
+) -> dict:
     total = len(results)
-    # WebShop uses continuous reward, not binary success
     rewards = [r.get("reward", 0.0) for r in results]
     avg_reward = sum(rewards) / len(rewards) if rewards else 0.0
-    successes = sum(1 for r in rewards if r >= 0.5)
+    successes = sum(1 for r in rewards if is_exact_success(r))
 
     total_tokens = sum(r["total_tokens"] for r in results)
     agent_tokens = sum(r.get("agent_tokens", r["total_tokens"]) for r in results)
@@ -76,10 +214,13 @@ def compute_summary(results: list[dict], memory_stats: dict, mode: str) -> dict:
     return {
         "mode": mode,
         "benchmark": "webshop",
+        "memory_setting": memory_setting,
+        "success_definition": "reward == 1.0",
         "total_envs": total,
         "total_success": successes,
         "success_rate": round(successes / total, 4) if total > 0 else 0,
         "avg_reward": round(avg_reward, 4),
+        "task_score": round(100 * avg_reward, 2),
         "total_tokens": total_tokens,
         "agent_tokens": agent_tokens,
         "judge_tokens": judge_tokens,
@@ -89,14 +230,45 @@ def compute_summary(results: list[dict], memory_stats: dict, mode: str) -> dict:
     }
 
 
+def make_error_episode_result(
+    env_idx: int,
+    sample_position: int,
+    eval_split: str,
+    error: Exception,
+) -> dict:
+    """Create a failed episode record for infrastructure/runtime errors."""
+    return {
+        "env_idx": env_idx,
+        "sample_position": sample_position,
+        "eval_split": eval_split,
+        "task_type": "shopping",
+        "task_description": "",
+        "success": False,
+        "success_definition": "reward == 1.0",
+        "reward": 0.0,
+        "total_steps": 0,
+        "total_tokens": 0,
+        "agent_tokens": 0,
+        "judge_tokens": 0,
+        "extractor_tokens": 0,
+        "failures_detected": 0,
+        "memories_retrieved": 0,
+        "memories_stored": 0,
+        "wall_time_s": 0,
+        "error": str(error),
+        "steps": [],
+    }
+
+
 def log_summary(summary: dict):
     logger.info("")
     logger.info("=" * 60)
     logger.info(f"  {summary['mode']} Results (WebShop)")
     logger.info("=" * 60)
-    logger.info(f"  Success (reward≥0.5): {summary['total_success']}/{summary['total_envs']} "
+    logger.info(f"  Success (reward == 1.0): {summary['total_success']}/{summary['total_envs']} "
                 f"({summary['success_rate']:.1%})")
     logger.info(f"  Avg Reward: {summary['avg_reward']:.4f}")
+    logger.info(f"  Task Score: {summary['task_score']:.2f}")
     logger.info("-" * 60)
     logger.info(f"  Tokens: {summary['total_tokens']:,} total, "
                 f"{summary['avg_tokens_per_episode']:,} avg/episode")
@@ -124,6 +296,7 @@ class WebShopReActAgent:
         memory_style: str = "original",
         memory_format: str = "failure_recovery",
         cross_env: bool = False,
+        allow_memory_updates: bool = True,
     ):
         self.llm = llm
         self.memory = memory_store
@@ -136,6 +309,7 @@ class WebShopReActAgent:
         self.memory_style = memory_style
         self.memory_format = memory_format
         self.cross_env = cross_env
+        self.allow_memory_updates = allow_memory_updates
 
     def run_episode(self, env, env_idx: int = 0) -> dict:
         from prompts.webshop_prompts import build_user_prompt, SYSTEM_PROMPT_FM
@@ -149,6 +323,7 @@ class WebShopReActAgent:
             self.extractor_llm.tracker.reset()
 
         init_obs, task_type, info = env.reset(session_idx=env_idx)
+        valid_actions = info.get("available_actions", [])
 
         history: list[tuple[str, str]] = []
         action_history: list[str] = []
@@ -161,7 +336,11 @@ class WebShopReActAgent:
 
         episode_memories = None
         if self.enable_memory and self.inject_mode == "episode":
-            all_mem = self.memory.get_all(env_idx=env_idx, cross_env=self.cross_env)
+            all_mem = self.memory.get_all(
+                env_idx=env_idx,
+                task_type=task_type,
+                cross_env=self.cross_env,
+            )
             if all_mem:
                 episode_memories = all_mem[:self.max_memory_inject]
                 memories_retrieved_total = len(episode_memories)
@@ -171,11 +350,13 @@ class WebShopReActAgent:
                 prompt = build_user_prompt(
                     task_type=task_type, task_obs=init_obs, history=history,
                     retrieved_memories=episode_memories, memory_style=self.memory_style,
+                    valid_actions=valid_actions,
                 )
             else:
                 prompt = build_user_prompt(
                     task_type=task_type, task_obs=init_obs, history=history,
                     retrieved_memories=current_retrieved, memory_style=self.memory_style,
+                    valid_actions=valid_actions,
                 )
 
             response = self.llm.complete_text(
@@ -190,18 +371,7 @@ class WebShopReActAgent:
             if action.startswith("> "):
                 action = action[2:]
 
-            # Extract search[...] or click[...] from response
-            import re
-            search_match = re.search(r'search\[([^\]]+)\]', action)
-            click_match = re.search(r'click\[([^\]]+)\]', action)
-            if search_match:
-                action = f"search[{search_match.group(1)}]"
-            elif click_match:
-                action = f"click[{click_match.group(1)}]"
-            elif not action or not (action.startswith("search[") or action.startswith("click[")):
-                # If LLM didn't produce a valid action, default
-                if "search" not in action.lower():
-                    action = "search[product]"
+            action = self._normalize_action(action, valid_actions)
 
             logger.info(f"  Step {step_num}: {action[:80]}")
 
@@ -217,6 +387,7 @@ class WebShopReActAgent:
                 continue
 
             observation, reward, done, step_info = env.step(action)
+            valid_actions = step_info.get("available_actions", valid_actions)
             logger.info(f"    obs: {observation[:80]}")
             action_history.append(action)
             final_reward = max(final_reward, reward)
@@ -254,11 +425,11 @@ class WebShopReActAgent:
 
         # Post-episode memory extraction
         memories_stored = 0
-        if self.enable_memory and self.extractor_llm is not None:
+        if self.enable_memory and self.extractor_llm is not None and self.allow_memory_updates:
             env_history = [(a, o) for a, o in history if not a.startswith("think")]
             if self.memory_format == "success_trajectory":
                 from src.memory_extractor_ablation import extract_success_trajectories
-                recoveries = extract_success_trajectories(self.extractor_llm, env_history, final_reward >= 0.5)
+                recoveries = extract_success_trajectories(self.extractor_llm, env_history, is_exact_success(final_reward))
             elif self.memory_format == "reflexion_reflection":
                 from src.memory_extractor_ablation import extract_reflexion_reflections
                 recoveries = extract_reflexion_reflections(self.extractor_llm, env_history)
@@ -287,7 +458,8 @@ class WebShopReActAgent:
             "env_idx": env_idx,
             "task_type": task_type,
             "task_description": init_obs[:200],
-            "success": final_reward >= 0.5,
+            "success": is_exact_success(final_reward),
+            "success_definition": "reward == 1.0",
             "reward": final_reward,
             "total_steps": len(steps),
             "total_tokens": total_tokens,
@@ -302,11 +474,54 @@ class WebShopReActAgent:
             "steps": steps,
         }
 
-        status = "SUCCESS" if final_reward >= 0.5 else "FAIL"
+        status = "SUCCESS" if is_exact_success(final_reward) else "FAIL"
         logger.info(
             f"Env #{env_idx} [{task_type}] {status} reward={final_reward:.4f} in {len(steps)} steps"
         )
         return result
+
+    @staticmethod
+    def _normalize_action(action: str, valid_actions: list[str] | dict | None) -> str:
+        """Coerce model output to one of the official valid actions when available."""
+        import re
+
+        if isinstance(valid_actions, dict):
+            valid_list = []
+        else:
+            valid_list = list(valid_actions or [])
+
+        search_match = re.search(r"search\[([^\]]+)\]", action)
+        click_match = re.search(r"click\[([^\]]+)\]", action)
+        if search_match:
+            action = f"search[{search_match.group(1)}]"
+        elif click_match:
+            action = f"click[{click_match.group(1)}]"
+
+        if not valid_list:
+            if not action or not (action.startswith("search[") or action.startswith("click[")):
+                return "search[product]"
+            return action
+
+        if action in valid_list:
+            return action
+
+        lowered = action.lower()
+        for candidate in valid_list:
+            if candidate.lower() == lowered:
+                return candidate
+
+        if action.startswith("search["):
+            search_actions = [candidate for candidate in valid_list if candidate.startswith("search[")]
+            if search_actions:
+                return search_actions[-1]
+
+        if action.startswith("click["):
+            target = action[6:-1].lower()
+            for candidate in valid_list:
+                if candidate.startswith("click[") and target in candidate.lower():
+                    return candidate
+
+        return valid_list[0]
 
 
 def main():
@@ -321,6 +536,14 @@ def main():
     is_baseline = args.baseline
     mode = "react_baseline" if is_baseline else "react_fm"
     run_name = args.run_name or f"ws_{mode}_"
+    num_products = parse_num_products(args.num_products)
+    max_envs = args.max_envs or args.eval_sample_size
+    session_ids = load_or_sample_session_ids(
+        args.sample_ids,
+        split=args.eval_split,
+        sample_size=max_envs,
+        seed=args.eval_sample_seed,
+    )
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     results_dir = f"{config['experiment']['results_dir']}/{timestamp}"
@@ -342,14 +565,16 @@ def main():
 
     memory_store = None
     if not is_baseline:
+        validate_memory_requirements(args.memory_setting, args.resume_memory)
         memory_store = FailureMemoryStore(
             embedding_model_name=config["memory"]["embedding_model"],
             max_entries=config["memory"]["max_entries"],
             top_k=config["memory"]["retrieval_top_k"],
             retrieval_mode=args.retrieval_mode,
+            scope=memory_scope_for_setting(args.memory_setting),
         )
         if args.resume_memory:
-            memory_store.load(args.resume_memory)
+            load_memory_for_setting(memory_store, args.resume_memory, args.memory_setting)
 
     judge_llm = None
     if not is_baseline and "judge" in config:
@@ -387,9 +612,9 @@ def main():
         memory_style=args.memory_style,
         memory_format=args.memory_format,
         cross_env=args.cross_env,
+        allow_memory_updates=args.memory_setting == "online",
     )
 
-    max_envs = args.max_envs or 200
     env_success: dict[int, float] = {}
 
     if args.resume_results:
@@ -397,7 +622,7 @@ def main():
             prev_data = json.load(f)
         for ep in prev_data.get("episodes", []):
             idx = ep["env_idx"]
-            if ep.get("reward", 0) >= 0.5:
+            if is_exact_success(ep.get("reward", 0)):
                 env_success[idx] = ep["reward"]
 
     for epoch in range(1, num_epochs + 1):
@@ -406,23 +631,33 @@ def main():
         logger.info(f"  Epoch {epoch}/{num_epochs} — {mode} (WebShop)")
         logger.info("=" * 60)
 
-        env = WebShopEnv(num_products=args.num_products, max_sessions=max_envs)
+        env = WebShopEnv(
+            num_products=num_products,
+            observation_mode=args.observation_mode,
+            max_sessions=max_envs,
+            human_goals=args.human_goals,
+            split=args.eval_split,
+            step_limit=args.max_steps,
+            wrapper=args.webshop_wrapper,
+        )
         env.setup()
 
         episode_results = []
-        env_count = 0
+        sample_pos = 0
         num_skipped = 0
 
-        while env_count < max_envs:
+        while sample_pos < len(session_ids):
+            session_id = session_ids[sample_pos]
             try:
-                if epoch > 1 and env_count in env_success:
+                if epoch > 1 and session_id in env_success:
                     env.skip()
                     episode_results.append({
-                        "env_idx": env_count,
+                        "env_idx": session_id,
                         "task_type": "shopping",
                         "task_description": "",
                         "success": True,
-                        "reward": env_success[env_count],
+                        "success_definition": "reward == 1.0",
+                        "reward": env_success[session_id],
                         "total_steps": 0,
                         "total_tokens": 0,
                         "agent_tokens": 0,
@@ -436,46 +671,80 @@ def main():
                         "steps": [],
                     })
                     num_skipped += 1
-                    env_count += 1
+                    sample_pos += 1
                     continue
 
-                result = agent.run_episode(env, env_idx=env_count)
+                result = agent.run_episode(env, env_idx=session_id)
+                result["sample_position"] = sample_pos
+                result["eval_split"] = args.eval_split
                 episode_results.append(result)
 
-                if result["reward"] >= 0.5:
-                    env_success[env_count] = result["reward"]
+                if is_exact_success(result["reward"]):
+                    env_success[session_id] = result["reward"]
 
-                env_count += 1
+                sample_pos += 1
 
                 rewards = [r.get("reward", 0) for r in episode_results]
                 avg_r = sum(rewards) / len(rewards)
-                logger.info(f"  [{env_count}] reward={result['reward']:.4f} "
+                logger.info(f"  [{sample_pos}/{len(session_ids)}] session={session_id} "
+                            f"reward={result['reward']:.4f} "
                             f"running_avg={avg_r:.4f}")
 
-                if env_count % 10 == 0:
+                if sample_pos % 10 == 0:
                     mem_stats = memory_store.stats() if memory_store else {}
-                    summary = compute_summary(episode_results, mem_stats, mode)
+                    summary = compute_summary(
+                        episode_results,
+                        mem_stats,
+                        mode,
+                        memory_setting=args.memory_setting,
+                    )
                     save_results(
                         episode_results, summary,
                         f"{results_dir}/{run_name}{epoch}_intermediate.json"
                     )
+                    save_sample_ids(session_ids, f"{results_dir}/{run_name}{epoch}_sample_ids.json")
                     if memory_store:
                         memory_store.save(f"{memory_dir}/ws_epoch{epoch}_intermediate.json")
 
             except Exception as e:
-                logger.error(f"Error on env #{env_count}: {e}", exc_info=True)
-                env_count += 1
+                logger.error(f"Error on session #{session_id}: {e}", exc_info=True)
+                episode_results.append(
+                    make_error_episode_result(
+                        env_idx=session_id,
+                        sample_position=sample_pos,
+                        eval_split=args.eval_split,
+                        error=e,
+                    )
+                )
+                sample_pos += 1
 
         if num_skipped > 0:
             logger.info(f"  Skipped {num_skipped} already-succeeded envs")
 
         mem_stats = memory_store.stats() if memory_store else {}
-        summary = compute_summary(episode_results, mem_stats, mode)
+        summary = compute_summary(
+            episode_results,
+            mem_stats,
+            mode,
+            memory_setting=args.memory_setting,
+        )
+        summary.update({
+            "eval_split": args.eval_split,
+            "eval_sample_size": len(session_ids),
+            "eval_sample_seed": args.eval_sample_seed,
+            "num_products": "full" if num_products is None else num_products,
+            "human_goals": args.human_goals,
+            "max_steps": args.max_steps,
+            "webshop_wrapper": args.webshop_wrapper,
+        })
         log_summary(summary)
 
         result_path = f"{results_dir}/{run_name}{epoch}.json"
         save_results(episode_results, summary, result_path)
+        sample_path = f"{results_dir}/{run_name}{epoch}_sample_ids.json"
+        save_sample_ids(session_ids, sample_path)
         logger.info(f"Results saved: {result_path}")
+        logger.info(f"Sample IDs saved: {sample_path}")
 
         if memory_store:
             mem_path = f"{memory_dir}/ws_epoch{epoch}.json"
