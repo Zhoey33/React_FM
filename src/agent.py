@@ -82,6 +82,7 @@ class ReactFMAgent:
         enable_memory: bool = True,
         inject_mode: str = "in_loop",
         memory_style: str = "original",
+        memory_format: str = "failure_recovery",
     ):
         self.llm = llm
         self.memory = memory_store
@@ -90,8 +91,10 @@ class ReactFMAgent:
         self.max_steps = max_steps
         self.max_memory_inject = max_memory_inject
         self.enable_memory = enable_memory and (memory_store is not None)
+        self.memory_format = memory_format  # failure_recovery, success_trajectory, reflexion_reflection
         self.inject_mode = inject_mode  # "in_loop", "episode", or "none"
         self.memory_style = memory_style  # "original", "factual", "reflexion", "hint"
+        self.cross_env = False  # set True for benchmarks where memories transfer across envs
 
     def run_episode(self, env, env_idx: int = 0) -> EpisodeResult:
         """Run one ALFWorld episode."""
@@ -119,7 +122,7 @@ class ReactFMAgent:
         # Episode-level injection: retrieve all memories at start
         episode_memories: list | None = None
         if self.enable_memory and self.inject_mode == "episode":
-            all_mem = self.memory.get_all(env_idx=env_idx)
+            all_mem = self.memory.get_all(env_idx=env_idx, cross_env=self.cross_env)
             if all_mem:
                 episode_memories = all_mem[:self.max_memory_inject]
                 memories_retrieved_total = len(episode_memories)
@@ -193,7 +196,7 @@ class ReactFMAgent:
                     failures_detected += 1
                     logger.info(f"    FAILURE detected: {det.failure_type}")
 
-                    # Retrieve memories for next prompt (per-env, skip for "none" mode)
+                    # Retrieve memories for next prompt (per-env or cross-env, skip for "none" mode)
                     if self.inject_mode == "in_loop":
                         retrieved = self.memory.retrieve(
                             query_action=action,
@@ -201,6 +204,7 @@ class ReactFMAgent:
                             task_type=task_type,
                             top_k=self.max_memory_inject,
                             env_idx=env_idx,
+                            cross_env=self.cross_env,
                         )
                         record.memory_retrieved = len(retrieved)
                         memories_retrieved_total += len(retrieved)
@@ -216,11 +220,11 @@ class ReactFMAgent:
                 success = is_success
                 break
 
-        # Post-episode: extract failure-recovery pairs and store in memory
+        # Post-episode: extract and store memories (format depends on memory_format)
         memories_stored = 0
         if self.enable_memory and self.extractor_llm is not None:
-            logger.info(f"  Extracting failure-recovery pairs...")
-            memories_stored = self._extract_and_store(history, task_type, env_idx)
+            logger.info(f"  Extracting memories (format={self.memory_format})...")
+            memories_stored = self._extract_and_store(history, task_type, env_idx, success)
             logger.info(f"  Extracted and stored {memories_stored} memories")
 
         wall_time = time.time() - t0
@@ -260,8 +264,8 @@ class ReactFMAgent:
         )
         return result
 
-    def _extract_and_store(self, history: list[tuple[str, str]], task_type: str, env_idx: int = 0) -> int:
-        """Extract failure-recovery pairs from trajectory and store in memory."""
+    def _extract_and_store(self, history: list[tuple[str, str]], task_type: str, env_idx: int = 0, success: bool = False) -> int:
+        """Extract memories from trajectory and store. Format depends on self.memory_format."""
         # Filter to only valid env actions — exclude think and invalid LLM outputs
         _VALID_PREFIXES = ("go to", "take", "put", "open", "close", "toggle",
                            "clean", "cool", "heat", "use", "examine", "look", "inventory")
@@ -269,7 +273,16 @@ class ReactFMAgent:
             (a, o) for a, o in history
             if a.lower().startswith(_VALID_PREFIXES)
         ]
-        recoveries = extract_failure_recoveries(self.extractor_llm, env_history)
+
+        if self.memory_format == "success_trajectory":
+            from src.memory_extractor_ablation import extract_success_trajectories
+            recoveries = extract_success_trajectories(self.extractor_llm, env_history, success)
+        elif self.memory_format == "reflexion_reflection":
+            from src.memory_extractor_ablation import extract_reflexion_reflections
+            recoveries = extract_reflexion_reflections(self.extractor_llm, env_history)
+        else:  # failure_recovery (default)
+            recoveries = extract_failure_recoveries(self.extractor_llm, env_history)
+
         stored = 0
         for rec in recoveries:
             self.memory.add(

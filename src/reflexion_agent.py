@@ -71,18 +71,38 @@ class EnvironmentHistory:
         return s
 
 
-def generate_reflection(llm: LLMClient, log_str: str, memory: list[str]) -> str:
+def generate_reflection(llm: LLMClient, log_str: str, memory: list[str], domain: str = "alfworld") -> str:
     """Generate a reflection for a failed episode.
     Reproduces generate_reflections.py from the Reflexion repo.
+    Supports domains: alfworld, webshop, scienceworld.
     """
-    # Parse scenario from log
-    scenario = log_str.split("Here is the task:")[-1].strip()
+    # Parse scenario from log. Different runners may use either
+    # "Here is the task:" or "Here is the task." as the section header.
+    scenario = log_str
+    for marker in ("Here is the task:", "Here is the task."):
+        if marker in log_str:
+            scenario = log_str.split(marker, 1)[-1].strip()
+            break
+    if not scenario or scenario == log_str.strip():
+        # Fallback: use full log (for non-ALFWorld domains)
+        scenario = log_str[-3000:]  # truncate to avoid token overflow
 
-    query = f"""You will be given the history of a past experience in which you were placed in an environment and given a task to complete. You were unsuccessful in completing the task. Do not summarize your environment, but rather think about the strategy and path you took to attempt to complete the task. Devise a concise, new plan of action that accounts for your mistake with reference to specific actions that you should have taken. For example, if you tried A and B but forgot C, then devise a plan to achieve C with environment-specific actions. You will need this later when you are solving the same task. Give your plan after "Plan". Here are two examples:
+    domain_desc = {
+        "alfworld": "placed in an environment and given a task to complete",
+        "webshop": "given a shopping task to find and purchase a product online",
+        "scienceworld": "given a science experiment task to complete in a simulated environment",
+        "hotpotqa": "given a multi-hop question-answering task using Wikipedia search",
+        "toolbench": "given a task that requires calling multiple APIs to gather information and provide an answer",
+    }
+    desc = domain_desc.get(domain, domain_desc["alfworld"])
 
-{REFLEXION_FEW_SHOT}
+    few_shot = ""
+    if domain == "alfworld":
+        few_shot = f"\n\n{REFLEXION_FEW_SHOT}\n\n"
+    else:
+        few_shot = "\n\n"
 
-{scenario}"""
+    query = f"""You will be given the history of a past experience in which you were {desc}. You were unsuccessful in completing the task. Do not summarize your environment, but rather think about the strategy and path you took to attempt to complete the task. Devise a concise, new plan of action that accounts for your mistake with reference to specific actions that you should have taken. For example, if you tried A and B but forgot C, then devise a plan to achieve C with environment-specific actions. You will need this later when you are solving the same task. Give your plan after "Plan".{few_shot}{scenario}"""
 
     if memory:
         query += "\n\nPlans from past attempts:\n"

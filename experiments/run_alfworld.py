@@ -45,6 +45,10 @@ def parse_args():
                         help="Only run envs that have memory entries (skip rest)")
     parser.add_argument("--memory-style", choices=["original", "factual", "reflexion", "hint"],
                         default="original", help="Memory prompt style")
+    parser.add_argument("--memory-format", choices=["failure_recovery", "success_trajectory", "reflexion_reflection"],
+                        default="failure_recovery", help="Memory storage format for ablation")
+    parser.add_argument("--retrieval-mode", choices=["hybrid", "bm25_only", "embedding_only", "random"],
+                        default="hybrid", help="Retrieval method for ablation")
     return parser.parse_args()
 
 
@@ -166,6 +170,7 @@ def main():
             embedding_model_name=config["memory"]["embedding_model"],
             max_entries=config["memory"]["max_entries"],
             top_k=config["memory"]["retrieval_top_k"],
+            retrieval_mode=args.retrieval_mode,
         )
         if args.resume_memory:
             memory_store.load(args.resume_memory)
@@ -206,6 +211,7 @@ def main():
         enable_memory=not is_baseline,
         inject_mode=args.inject_mode,
         memory_style=args.memory_style,
+        memory_format=args.memory_format,
     )
 
     # Determine which envs to run (for --only-memory-envs)

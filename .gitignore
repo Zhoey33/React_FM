@@ -10,9 +10,14 @@ build/
 logs/
 results/
 memory_store/
+memory/
+rollouts/
+checkpoints/
+gate_models/
 
 # Model weights and caches
 *.pth
+*.pkl
 ~/.cache/
 
 # IDE
@@ -27,3 +32,28 @@ memory_store/
 
 # Environment
 .env
+
+# Local workflow state / stray directories / caches
+/~/
+**/__pycache__/
+*.console
+REVIEW_STATE.json
+cleanup/
+
+# Third-party benchmark checkout / secret leftovers
+data/StableToolBench/
+
+# Paper build artifacts
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.log
+paper/*.out
+paper/*.pdf
+paper/*.synctex*
+paper/*.xdv
+
+# Downloaded paper library
+papers/

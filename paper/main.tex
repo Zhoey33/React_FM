@@ -1,0 +1,45 @@
+\documentclass{article}
+
+% ICLR 2027 style
+\usepackage{iclr2025_conference}
+
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xcolor}
+\usepackage{subcaption}
+
+\title{React\_FM: Failure-Triggered In-Loop Memory for Online Adaptation of LLM Agents}
+
+\author{
+Anonymous Authors
+}
+
+\newcommand{\method}{React\_FM}
+\newcommand{\ie}{\textit{i.e.}}
+\newcommand{\eg}{\textit{e.g.}}
+\newcommand{\etal}{\textit{et al.}}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Large language model (LLM) agents powered by the ReAct framework often repeat the same mistakes when encountering recurring task instances, lacking mechanisms to leverage past failure experiences in real time. Existing experiential memory approaches such as Reflexion inject reflections only at episode boundaries, preventing mid-episode course correction. We propose \method{}, a failure-triggered in-loop memory system for online adaptation in recurring-instance settings: it detects failures during execution, retrieves relevant past failure-recovery experiences via hybrid BM25-embedding retrieval, and injects corrective guidance into the agent's next reasoning step. Evaluated on five benchmarks---ALFWorld, WebShop, ScienceWorld, HotPotQA, and ToolBench---\method{} achieves the highest success rate on ALFWorld and remains competitive on diverse benchmarks where failure modes differ. On the formal ScienceWorld Step~4 no-gate protocol (111 episodes across 12 task types), ExpeL reaches the highest success rate (49.55\%, 57.78 average raw score), while online \method{} achieves the highest raw score among non-ExpeL memory settings (41.44\%, 64.25) and improves over offline memory (39.64\%, 48.83), the ReAct baseline (37.84\%, 47.21), and corrected Reflexion (36.94\%, 49.39) without requiring a full pre-collection epoch. On short-horizon or strategy-dominated benchmarks (WebShop, ToolBench), episode-level methods like ExpeL remain competitive or superior, suggesting a complementary rather than universally superior operating regime. A cross-environment transfer experiment on three benchmarks reveals that the effectiveness of shared memory depends on task homogeneity: on WebShop (homogeneous tasks), shared memory achieves per-environment Epoch~2 performance in a single epoch; on HotPotQA, moderate transfer occurs (+1.3\% EM); on ToolBench (heterogeneous APIs), shared memory causes negative transfer ($-$19.9\%), suggesting that cross-environment sharing should be enabled selectively based on task similarity.
+\end{abstract}
+
+\input{sections/introduction}
+\input{sections/related_work}
+\input{sections/method}
+\input{sections/experiments}
+\input{sections/conclusion}
+
+\bibliography{references}
+\bibliographystyle{iclr2025_conference}
+
+\end{document}

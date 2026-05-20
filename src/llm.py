@@ -1,6 +1,7 @@
 """LLM API client wrapper with retry and token tracking."""
 
 import time
+import random
 import logging
 from dataclasses import dataclass, field
 from openai import OpenAI
@@ -122,10 +123,11 @@ class LLMClient:
         stop: list[str] | None = None,
         label: str = "",
         system: str | None = None,
+        max_tokens: int | None = None,
     ) -> str:
         """Convenience: single prompt string → response text."""
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
-        return self.chat(messages, stop=stop, label=label).content
+        return self.chat(messages, stop=stop, label=label, max_tokens=max_tokens).content

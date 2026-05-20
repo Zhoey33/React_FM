@@ -54,6 +54,9 @@ def setup_logging(
     logging.getLogger("openai").setLevel(logging.WARNING)
     logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
     logging.getLogger("transformers").setLevel(logging.WARNING)
+    logging.getLogger("py4j").setLevel(logging.WARNING)
+    logging.getLogger("py4j.java_gateway").setLevel(logging.WARNING)
+    logging.getLogger("py4j.clientserver").setLevel(logging.WARNING)
 
     root.info(f"Logging to console ({log_level}) and file ({filepath})")
     return root

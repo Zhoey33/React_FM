@@ -1,26 +1,23 @@
 llm:
   model: "Qwen/Qwen3.5-9B"
   base_url: "https://api.siliconflow.cn/v1"
-  api_key: "sk-esdkdysuokthpgbqqxciogqhdihplqiadcwpnqclwavyrwrs"
   temperature: 0.0
   max_tokens: 256
 
 judge:
   model: "Qwen/Qwen3.5-9B"
   base_url: "https://api.siliconflow.cn/v1"
-  api_key: "sk-esdkdysuokthpgbqqxciogqhdihplqiadcwpnqclwavyrwrs"
   temperature: 0.0
   max_tokens: 16
 
 extractor:
   model: "deepseek-ai/DeepSeek-V3.2"
   base_url: "https://api.siliconflow.cn/v1"
-  api_key: "sk-esdkdysuokthpgbqqxciogqhdihplqiadcwpnqclwavyrwrs"
   temperature: 0.0
   max_tokens: 512
 
 agent:
-  max_steps: 50
+  max_steps: 100
   max_memory_inject: 3
   enable_memory: true
 

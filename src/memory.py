@@ -1,6 +1,8 @@
 """Failure Memory Store with hybrid BM25 + Embedding retrieval (RRF fusion).
 
-Per-env storage: each env_idx maintains its own memory entries.
+Storage is bucketed by a configurable scope:
+- ``env_idx`` (default): legacy per-episode/per-env isolation
+- ``task_type``: share memories across variations of the same task
 """
 
 import json
@@ -16,6 +18,25 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class RetrievalResult:
+    """Result of a memory retrieval with RRF scores for the gate."""
+    entries: list  # list[FailureMemoryEntry]
+    rrf_scores: list[float]  # RRF score per returned entry (same order)
+
+    @property
+    def top1_score(self) -> float:
+        """Top-1 RRF score (gate feature: retrieval_rrf_score)."""
+        return self.rrf_scores[0] if self.rrf_scores else 0.0
+
+    @property
+    def margin(self) -> float:
+        """Top-1 minus top-2 RRF score (gate feature: retrieval_margin)."""
+        if len(self.rrf_scores) >= 2:
+            return self.rrf_scores[0] - self.rrf_scores[1]
+        return self.rrf_scores[0] if self.rrf_scores else 0.0
+
+
+@dataclass
 class FailureMemoryEntry:
     memory_id: int
     failure_action: str
@@ -25,6 +46,13 @@ class FailureMemoryEntry:
     env_idx: int = 0
     created_at: str = ""
     embedding: np.ndarray | None = None
+    # Gate-related fields (populated by canonicalization pipeline)
+    question_text: str = ""  # LLM-canonicalized diagnostic question (no answer revealed)
+    repair_text: str = ""    # LLM-canonicalized full repair instruction
+    # Tiered repair fields (v2 canonicalization — strategy/tactic/action levels)
+    repair_strategy: str = ""  # L1: high-level goal/direction guidance
+    repair_tactic: str = ""    # L2: multi-step plan for next actions
+    repair_action: str = ""    # L3: exact corrective command(s)
 
     def to_prompt_str(self) -> str:
         return (
@@ -32,8 +60,26 @@ class FailureMemoryEntry:
             f"Solution: {self.solution_action}"
         )
 
+    def get_repair_display(self) -> str:
+        """Return the best available repair text for prompt injection.
+
+        Priority: tiered repair (strategy/tactic/action) > repair_text > solution_action.
+        Tiered format gives the agent strategic context, not just action-level fixes.
+        """
+        if self.repair_strategy:
+            parts = []
+            parts.append(f"[Strategy] {self.repair_strategy}")
+            if self.repair_tactic:
+                parts.append(f"[Plan] {self.repair_tactic}")
+            if self.repair_action:
+                parts.append(f"[Next action] {self.repair_action}")
+            return "\n".join(parts)
+        if self.repair_text:
+            return self.repair_text
+        return self.solution_action
+
     def to_dict(self) -> dict:
-        return {
+        d = {
             "memory_id": self.memory_id,
             "failure_action": self.failure_action,
             "failure_observation": self.failure_observation,
@@ -42,6 +88,18 @@ class FailureMemoryEntry:
             "env_idx": self.env_idx,
             "created_at": self.created_at,
         }
+        # Only include gate fields if they are populated
+        if self.question_text:
+            d["question_text"] = self.question_text
+        if self.repair_text:
+            d["repair_text"] = self.repair_text
+        if self.repair_strategy:
+            d["repair_strategy"] = self.repair_strategy
+        if self.repair_tactic:
+            d["repair_tactic"] = self.repair_tactic
+        if self.repair_action:
+            d["repair_action"] = self.repair_action
+        return d
 
 
 class FailureMemoryStore:
@@ -52,18 +110,63 @@ class FailureMemoryStore:
         top_k: int = 3,
         rrf_k: int = 60,
         min_score: float = 0.0,
+        retrieval_mode: str = "hybrid",
+        scope: str = "env_idx",
     ):
+        if scope not in {"env_idx", "task_type"}:
+            raise ValueError(f"Unsupported memory scope: {scope}")
         self.embedding_model_name = embedding_model_name
-        self.max_entries = max_entries  # per-env max
+        self.max_entries = max_entries  # per-bucket max
         self.top_k = top_k
         self.rrf_k = rrf_k
         self.min_score = min_score
-        self._env_entries: dict[int, list[FailureMemoryEntry]] = {}
+        self.retrieval_mode = retrieval_mode  # "hybrid", "bm25_only", "embedding_only", "random"
+        self.scope = scope
+        self._env_entries: dict[object, list[FailureMemoryEntry]] = {}
         self._next_id = 0
         self._model = None
         # tracking
         self.total_retrievals = 0
         self.total_hits = 0  # retrievals that returned >=1 result
+
+    def _bucket_key(self, task_type: str = "", env_idx: int = 0):
+        """Resolve the storage bucket key for the configured scope."""
+        if self.scope == "task_type":
+            return task_type or "__unknown_task_type__"
+        return env_idx
+
+    def _bucket_label(self) -> str:
+        return "task_type" if self.scope == "task_type" else "env_idx"
+
+    def get_bucket_entries(
+        self,
+        task_type: str = "",
+        env_idx: int = 0,
+        cross_env: bool = False,
+    ) -> list[FailureMemoryEntry]:
+        """Return entries from the active bucket, or all buckets if cross_env=True."""
+        if cross_env:
+            entries: list[FailureMemoryEntry] = []
+            for bucket_entries in self._env_entries.values():
+                entries.extend(bucket_entries)
+            return entries
+        bucket_key = self._bucket_key(task_type=task_type, env_idx=env_idx)
+        return list(self._env_entries.get(bucket_key, []))
+
+    def entry_count(
+        self,
+        task_type: str = "",
+        env_idx: int = 0,
+        cross_env: bool = False,
+    ) -> int:
+        return len(self.get_bucket_entries(task_type=task_type, env_idx=env_idx, cross_env=cross_env))
+
+    def find_entry_by_id(self, memory_id: int) -> FailureMemoryEntry | None:
+        for entries in self._env_entries.values():
+            for entry in entries:
+                if entry.memory_id == memory_id:
+                    return entry
+        return None
 
     def _load_model(self):
         if self._model is None:
@@ -91,6 +194,10 @@ class FailureMemoryStore:
         solution_action: str,
         task_type: str = "",
         env_idx: int = 0,
+        question_text: str = "",
+        repair_strategy: str = "",
+        repair_tactic: str = "",
+        repair_action: str = "",
     ) -> FailureMemoryEntry:
         query_text = self._build_query_text(failure_action, failure_observation)
         embedding = self._embed(query_text)
@@ -104,17 +211,25 @@ class FailureMemoryStore:
             env_idx=env_idx,
             created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
             embedding=embedding,
+            question_text=question_text,
+            repair_strategy=repair_strategy,
+            repair_tactic=repair_tactic,
+            repair_action=repair_action,
         )
 
-        if env_idx not in self._env_entries:
-            self._env_entries[env_idx] = []
-        self._env_entries[env_idx].append(entry)
+        bucket_key = self._bucket_key(task_type=task_type, env_idx=env_idx)
+        if bucket_key not in self._env_entries:
+            self._env_entries[bucket_key] = []
+        self._env_entries[bucket_key].append(entry)
         self._next_id += 1
 
-        if len(self._env_entries[env_idx]) > self.max_entries:
-            self._env_entries[env_idx].pop(0)
+        if len(self._env_entries[bucket_key]) > self.max_entries:
+            self._env_entries[bucket_key].pop(0)
 
-        logger.info(f"Memory stored #{entry.memory_id} [env={env_idx}]: [{task_type}] {failure_action[:50]}... → {solution_action[:50]}...")
+        logger.info(
+            f"Memory stored #{entry.memory_id} [{self._bucket_label()}={bucket_key}]: "
+            f"[{task_type}] {failure_action[:50]}... → {solution_action[:50]}..."
+        )
         return entry
 
     def retrieve(
@@ -124,13 +239,26 @@ class FailureMemoryStore:
         task_type: str = "",
         top_k: int | None = None,
         env_idx: int = 0,
-    ) -> list[FailureMemoryEntry]:
+        cross_env: bool = False,
+        return_scores: bool = False,
+    ) -> "list[FailureMemoryEntry] | RetrievalResult":
+        """Retrieve relevant memories.
+
+        Args:
+            return_scores: If True, return RetrievalResult with RRF scores
+                           (needed by the intervention gate). Default False
+                           for backward compatibility.
+        """
         self.total_retrievals += 1
         k = top_k or self.top_k
 
-        candidates = self._env_entries.get(env_idx, [])
+        candidates = self.get_bucket_entries(
+            task_type=task_type,
+            env_idx=env_idx,
+            cross_env=cross_env,
+        )
         if not candidates:
-            return []
+            return RetrievalResult([], []) if return_scores else []
 
         # Filter by task_type if provided
         if task_type:
@@ -138,7 +266,62 @@ class FailureMemoryStore:
             if typed:
                 candidates = typed
 
+        # Random retrieval mode
+        if self.retrieval_mode == "random":
+            import random
+            results = random.sample(candidates, min(k, len(candidates)))
+            if results:
+                self.total_hits += 1
+            if return_scores:
+                # Assign uniform pseudo-scores for random mode
+                return RetrievalResult(results, [1.0 / len(candidates)] * len(results))
+            return results
+
         query_text = self._build_query_text(query_action, query_observation)
+
+        if self.retrieval_mode == "bm25_only":
+            query_tokens = self._tokenize(query_text)
+            corpus = [
+                self._tokenize(self._build_query_text(e.failure_action, e.failure_observation))
+                for e in candidates
+            ]
+            bm25 = BM25Okapi(corpus)
+            bm25_scores = bm25.get_scores(query_tokens)
+            sorted_indices = list(np.argsort(-bm25_scores))
+            results = [candidates[i] for i in sorted_indices[:k]]
+            scores = [float(bm25_scores[i]) for i in sorted_indices[:k]]
+            if results:
+                self.total_hits += 1
+                logger.debug(
+                    f"Memory retrieved {len(results)} entries "
+                    f"[{self._bucket_label()}={self._bucket_key(task_type=task_type, env_idx=env_idx)}, mode=bm25_only]"
+                )
+            if return_scores:
+                return RetrievalResult(results, scores)
+            return results
+
+        if self.retrieval_mode == "embedding_only":
+            query_emb = self._embed(query_text)
+            emb_scores = []
+            for entry in candidates:
+                if entry.embedding is not None:
+                    emb_scores.append(float(np.dot(query_emb, entry.embedding)))
+                else:
+                    emb_scores.append(-1.0)
+            sorted_indices = list(np.argsort(-np.array(emb_scores)))
+            results = [candidates[i] for i in sorted_indices[:k]]
+            scores = [emb_scores[i] for i in sorted_indices[:k]]
+            if results:
+                self.total_hits += 1
+                logger.debug(
+                    f"Memory retrieved {len(results)} entries "
+                    f"[{self._bucket_label()}={self._bucket_key(task_type=task_type, env_idx=env_idx)}, mode=embedding_only]"
+                )
+            if return_scores:
+                return RetrievalResult(results, scores)
+            return results
+
+        # Default: hybrid RRF
         query_tokens = self._tokenize(query_text)
         query_emb = self._embed(query_text)
 
@@ -172,18 +355,24 @@ class FailureMemoryStore:
 
         # Apply min_score filter and take top-k
         results = []
+        result_rrf = []
         for idx in sorted_indices[:k]:
             if self.min_score > 0 and rrf_scores[idx] < self.min_score:
                 break
             results.append(candidates[idx])
+            result_rrf.append(rrf_scores[idx])
 
         if results:
             self.total_hits += 1
             logger.debug(
-                f"Memory retrieved {len(results)} entries [env={env_idx}] for: {query_action[:50]}... "
-                f"top_rrf={rrf_scores[sorted_indices[0]]:.4f}"
+                f"Memory retrieved {len(results)} entries "
+                f"[{self._bucket_label()}={self._bucket_key(task_type=task_type, env_idx=env_idx)}] "
+                f"for: {query_action[:50]}... "
+                f"top_rrf={result_rrf[0]:.4f}"
             )
 
+        if return_scores:
+            return RetrievalResult(results, result_rrf)
         return results
 
     def save(self, filepath: str) -> None:
@@ -192,20 +381,28 @@ class FailureMemoryStore:
 
         data = {
             "next_id": self._next_id,
-            "envs": {},
+            "scope": self.scope,
+            "buckets": {},
         }
-        for env_idx, entries in self._env_entries.items():
-            env_data = []
+        for bucket_key, entries in self._env_entries.items():
+            bucket_data = []
             for entry in entries:
                 d = entry.to_dict()
                 if entry.embedding is not None:
                     d["embedding"] = entry.embedding.tolist()
-                env_data.append(d)
-            data["envs"][str(env_idx)] = env_data
+                bucket_data.append(d)
+            data["buckets"][str(bucket_key)] = bucket_data
+        if self.scope == "env_idx":
+            data["envs"] = data["buckets"]
+        else:
+            data["task_types"] = data["buckets"]
 
         with open(path, "w") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        logger.info(f"Memory saved: {self.size()} entries ({len(self._env_entries)} envs) → {filepath}")
+        logger.info(
+            f"Memory saved: {self.size()} entries ({len(self._env_entries)} {self._bucket_label()} buckets) "
+            f"→ {filepath}"
+        )
 
     def load(self, filepath: str) -> None:
         path = Path(filepath)
@@ -219,9 +416,22 @@ class FailureMemoryStore:
         self._next_id = data.get("next_id", 0)
         self._env_entries.clear()
 
-        for env_idx_str, entries_data in data.get("envs", {}).items():
-            env_idx = int(env_idx_str)
-            self._env_entries[env_idx] = []
+        saved_scope = data.get("scope")
+        if saved_scope in {"env_idx", "task_type"}:
+            self.scope = saved_scope
+
+        raw_buckets = data.get("buckets")
+        if raw_buckets is None:
+            if "task_types" in data:
+                raw_buckets = data.get("task_types", {})
+                self.scope = "task_type"
+            else:
+                raw_buckets = data.get("envs", {})
+                self.scope = "env_idx"
+
+        for bucket_key_str, entries_data in raw_buckets.items():
+            bucket_key = int(bucket_key_str) if self.scope == "env_idx" else bucket_key_str
+            self._env_entries[bucket_key] = []
             for d in entries_data:
                 emb = None
                 if "embedding" in d:
@@ -233,20 +443,33 @@ class FailureMemoryStore:
                     failure_observation=d["failure_observation"],
                     solution_action=d["solution_action"],
                     task_type=d.get("task_type", ""),
-                    env_idx=env_idx,
+                    env_idx=d.get("env_idx", bucket_key if self.scope == "env_idx" else 0),
                     created_at=d.get("created_at", ""),
                     embedding=emb,
+                    question_text=d.get("question_text", ""),
+                    repair_text=d.get("repair_text", ""),
+                    repair_strategy=d.get("repair_strategy", ""),
+                    repair_tactic=d.get("repair_tactic", ""),
+                    repair_action=d.get("repair_action", ""),
                 )
-                self._env_entries[env_idx].append(entry)
+                self._env_entries[bucket_key].append(entry)
 
-        logger.info(f"Memory loaded: {self.size()} entries ({len(self._env_entries)} envs) from {filepath}")
+        logger.info(
+            f"Memory loaded: {self.size()} entries ({len(self._env_entries)} {self._bucket_label()} buckets) "
+            f"from {filepath}"
+        )
 
-    def get_all(self, env_idx: int = 0) -> list[FailureMemoryEntry]:
-        """Return all entries for a given env_idx."""
-        return list(self._env_entries.get(env_idx, []))
+    def get_all(
+        self,
+        env_idx: int = 0,
+        task_type: str = "",
+        cross_env: bool = False,
+    ) -> list[FailureMemoryEntry]:
+        """Return all entries for the active bucket, or all buckets if cross_env=True."""
+        return self.get_bucket_entries(task_type=task_type, env_idx=env_idx, cross_env=cross_env)
 
-    def get_env_ids(self) -> set[int]:
-        """Return set of env_idxs that have memory entries."""
+    def get_env_ids(self) -> set:
+        """Return set of active bucket keys that have memory entries."""
         return set(self._env_entries.keys())
 
     def size(self) -> int:
