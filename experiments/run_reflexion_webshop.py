@@ -13,7 +13,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import json
 import logging
-import re
 import sys
 import random
 import time
@@ -28,7 +27,11 @@ from src.llm import LLMClient
 from src.webshop_env import WebShopEnv
 from src.reflexion_agent import generate_reflection
 from src.log_utils import setup_logging
-from prompts.webshop_prompts import FEWSHOT_EXAMPLE, SYSTEM_PROMPT_BASE
+from prompts.webshop_prompts import (
+    REFLEXION_SYSTEM_PROMPT,
+    build_reflexion_prompt,
+    normalize_reflexion_action,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +39,7 @@ logger = logging.getLogger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description="Run Reflexion on WebShop")
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--num-trials", type=int, default=2)
+    parser.add_argument("--num-trials", type=int, default=4)
     parser.add_argument("--max-envs", type=int, default=100)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--run-name", type=str, default="ws_reflexion_")
@@ -48,22 +51,6 @@ def parse_args():
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
-
-
-def build_reflexion_prompt(task_obs, history, memory=None):
-    """Build prompt with Reflexion memory injected at episode start."""
-    sections = [FEWSHOT_EXAMPLE]
-    if memory:
-        lines = ["Your memory for the task below:"]
-        for i, m in enumerate(memory):
-            lines.append(f"Trial {i}:\n{m.strip()}")
-        sections.append("\n".join(lines))
-    sections.append("Here is the task.\n" + task_obs)
-    prompt = "\n\n".join(sections) + "\n"
-    for action, obs in history:
-        prompt += f"> {action}\n{obs}\n"
-    prompt += "> "
-    return prompt
 
 
 def run_episode(llm, env, env_idx, memory, max_steps):
@@ -80,24 +67,12 @@ def run_episode(llm, env, env_idx, memory, max_steps):
     for step_num in range(max_steps):
         prompt = build_reflexion_prompt(init_obs, history, memory)
         response = llm.complete_text(prompt, stop=["\n"], label=f"step_{step_num}",
-                                     system=SYSTEM_PROMPT_BASE)
-        action = response.strip().split("\n")[0].strip()
-        if action.startswith("> "):
-            action = action[2:]
-
-        # Extract search[...] or click[...]
-        search_match = re.search(r'search\[([^\]]+)\]', action)
-        click_match = re.search(r'click\[([^\]]+)\]', action)
-        if search_match:
-            action = f"search[{search_match.group(1)}]"
-        elif click_match:
-            action = f"click[{click_match.group(1)}]"
-        elif not action or not (action.startswith("search[") or action.startswith("click[")):
-            action = "search[product]"
+                                     system=REFLEXION_SYSTEM_PROMPT)
+        action = normalize_reflexion_action(response)
 
         logger.info(f"  Step {step_num}: {action[:80]}")
 
-        if action.startswith("think:") or action.startswith("think "):
+        if action.startswith("think[") or action.startswith("think:") or action.startswith("think "):
             steps.append({"step": step_num, "action": action, "observation": "OK."})
             history.append((action, "OK."))
             continue
@@ -123,7 +98,8 @@ def run_episode(llm, env, env_idx, memory, max_steps):
         "env_idx": env_idx,
         "task_type": task_type,
         "task_description": init_obs[:200],
-        "success": final_reward >= 0.5,
+        "success": final_reward == 1.0,
+        "success_definition": "reward == 1.0",
         "reward": final_reward,
         "total_steps": len(steps),
         "total_tokens": agent_stats["total_tokens"],
@@ -144,15 +120,17 @@ def compute_summary(results, mode):
     total = len(results)
     rewards = [r.get("reward", 0.0) for r in results]
     avg_reward = sum(rewards) / len(rewards) if rewards else 0.0
-    successes = sum(1 for r in rewards if r >= 0.5)
+    successes = sum(1 for r in rewards if r == 1.0)
     total_tokens = sum(r.get("total_tokens", 0) for r in results)
     return {
         "mode": mode,
         "benchmark": "webshop",
+        "success_definition": "reward == 1.0",
         "total_envs": total,
         "total_success": successes,
         "success_rate": round(successes / total, 4) if total > 0 else 0,
         "avg_reward": round(avg_reward, 4),
+        "task_score": round(100 * avg_reward, 2),
         "total_tokens": total_tokens,
         "avg_tokens_per_episode": round(total_tokens / total) if total > 0 else 0,
     }
@@ -204,6 +182,7 @@ def main():
                 num_success += 1
                 trial_logs.append({
                     "env_idx": z, "task_type": "shopping", "success": True,
+                    "success_definition": "reward == 1.0",
                     "reward": env_configs[z]["reward"], "skipped": True,
                     "total_tokens": 0, "total_steps": 0, "wall_time_s": 0,
                 })
@@ -227,6 +206,7 @@ def main():
                 logger.error(f"Error on session #{z}: {e}", exc_info=True)
                 trial_logs.append({
                     "env_idx": z, "task_type": "shopping", "success": False,
+                    "success_definition": "reward == 1.0",
                     "reward": 0.0, "skipped": False, "total_tokens": 0,
                     "total_steps": 0, "wall_time_s": 0,
                 })
@@ -245,9 +225,19 @@ def main():
                         env_configs[z]["memory"].append(reflection)
                         num_reflected += 1
             logger.info(f"Generated {num_reflected} reflections")
+        else:
+            num_reflected = 0
 
         # Trial summary
         summary = compute_summary(trial_logs, "reflexion")
+        summary.update({
+            "trial": trial_idx,
+            "num_trials": args.num_trials,
+            "max_envs": args.max_envs,
+            "max_steps": args.max_steps,
+            "num_products": args.num_products,
+            "reflections_generated": num_reflected,
+        })
         logger.info(f"  Trial {trial_idx}: {summary['total_success']}/{summary['total_envs']} "
                     f"({summary['success_rate']:.1%}), avg_reward={summary['avg_reward']:.4f}")
 

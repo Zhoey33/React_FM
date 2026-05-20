@@ -14,6 +14,10 @@ _FEW_SHOT_FILE = Path(__file__).parent.parent / "prompts" / "reflexion_few_shot_
 with open(_FEW_SHOT_FILE) as f:
     REFLEXION_FEW_SHOT = f.read()
 
+_WEBSHOP_FEW_SHOT_FILE = Path(__file__).parent.parent / "prompts" / "webshop_reflexion_few_shot_examples.txt"
+with open(_WEBSHOP_FEW_SHOT_FILE) as f:
+    WEBSHOP_REFLEXION_FEW_SHOT = f.read()
+
 # Task type prefixes (same as alfworld_trial.py)
 PREFIXES = {
     "pick_and_place": "put",
@@ -96,17 +100,20 @@ def generate_reflection(llm: LLMClient, log_str: str, memory: list[str], domain:
     }
     desc = domain_desc.get(domain, domain_desc["alfworld"])
 
+    recent_memory = memory[-3:] if len(memory) > 3 else memory
     few_shot = ""
     if domain == "alfworld":
         few_shot = f"\n\n{REFLEXION_FEW_SHOT}\n\n"
+    elif domain == "webshop":
+        few_shot = f" There are two examples below.\n\n{WEBSHOP_REFLEXION_FEW_SHOT}\n\n"
     else:
         few_shot = "\n\n"
 
     query = f"""You will be given the history of a past experience in which you were {desc}. You were unsuccessful in completing the task. Do not summarize your environment, but rather think about the strategy and path you took to attempt to complete the task. Devise a concise, new plan of action that accounts for your mistake with reference to specific actions that you should have taken. For example, if you tried A and B but forgot C, then devise a plan to achieve C with environment-specific actions. You will need this later when you are solving the same task. Give your plan after "Plan".{few_shot}{scenario}"""
 
-    if memory:
+    if recent_memory:
         query += "\n\nPlans from past attempts:\n"
-        for i, m in enumerate(memory):
+        for i, m in enumerate(recent_memory):
             query += f"Trial #{i}: {m}\n"
 
     query += "\n\nNew plan:"
