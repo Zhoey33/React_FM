@@ -18,7 +18,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.llm import LLMClient
+from src.llm import LLMClient, RollingTokenRateLimiter
 from src.memory import FailureMemoryStore
 from src.webshop_failure_detector import WebShopFailureDetector
 from src.webshop_env import WebShopEnv
@@ -62,12 +62,24 @@ def parse_args():
                         help="Use official WebShop wrapper/valid-action interface or legacy direct text env")
     parser.add_argument("--sample-ids", type=str, default=None,
                         help="Optional JSON list of official split session IDs to run")
+    parser.add_argument("--llm-tpm-budget", type=int, default=12000,
+                        help="Shared LLM token-per-minute budget across agent/judge/extractor; 0 disables")
+    parser.add_argument("--agent-max-tokens", type=int, default=96,
+                        help="Max completion tokens for each WebShop action call")
     return parser.parse_args()
 
 
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
+
+
+def validate_llm_throttle_args(llm_tpm_budget: int, agent_max_tokens: int) -> None:
+    """Validate WebShop LLM throttling CLI arguments."""
+    if llm_tpm_budget < 0:
+        raise ValueError("--llm-tpm-budget must be 0 or a positive integer")
+    if agent_max_tokens <= 0:
+        raise ValueError("--agent-max-tokens must be a positive integer")
 
 
 def save_results(results: list[dict], summary: dict, filepath: str):
@@ -526,6 +538,7 @@ class WebShopReActAgent:
 
 def main():
     args = parse_args()
+    validate_llm_throttle_args(args.llm_tpm_budget, args.agent_max_tokens)
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
@@ -555,12 +568,21 @@ def main():
         run_name=run_name.rstrip("_"),
     )
 
+    rate_limiter = None
+    if args.llm_tpm_budget and args.llm_tpm_budget > 0:
+        rate_limiter = RollingTokenRateLimiter(tokens_per_minute=args.llm_tpm_budget)
+        logger.info("LLM TPM limiter enabled: %s tokens/minute", args.llm_tpm_budget)
+
+    agent_max_tokens = args.agent_max_tokens or config["llm"]["max_tokens"]
+    logger.info("WebShop agent max_tokens: %s", agent_max_tokens)
+
     llm = LLMClient(
         model=config["llm"]["model"],
         base_url=config["llm"]["base_url"],
         api_key=config["llm"].get("api_key") or os.environ.get("SILICONFLOW_API_KEY", ""),
         temperature=config["llm"]["temperature"],
-        max_tokens=config["llm"]["max_tokens"],
+        max_tokens=agent_max_tokens,
+        rate_limiter=rate_limiter,
     )
 
     memory_store = None
@@ -585,6 +607,7 @@ def main():
             api_key=judge_cfg.get("api_key") or os.environ.get("SILICONFLOW_API_KEY", ""),
             temperature=judge_cfg.get("temperature", 0.0),
             max_tokens=judge_cfg.get("max_tokens", 16),
+            rate_limiter=rate_limiter,
         )
 
     detector = WebShopFailureDetector(judge_llm=judge_llm)
@@ -598,6 +621,7 @@ def main():
             api_key=ext_cfg.get("api_key") or os.environ.get("SILICONFLOW_API_KEY", ""),
             temperature=ext_cfg.get("temperature", 0.0),
             max_tokens=ext_cfg.get("max_tokens", 512),
+            rate_limiter=rate_limiter,
         )
 
     agent = WebShopReActAgent(
@@ -614,6 +638,10 @@ def main():
         cross_env=args.cross_env,
         allow_memory_updates=args.memory_setting == "online",
     )
+    run_metadata = {
+        "llm_tpm_budget": args.llm_tpm_budget,
+        "agent_max_tokens": agent_max_tokens,
+    }
 
     env_success: dict[int, float] = {}
 
@@ -698,6 +726,7 @@ def main():
                         mode,
                         memory_setting=args.memory_setting,
                     )
+                    summary.update(run_metadata)
                     save_results(
                         episode_results, summary,
                         f"{results_dir}/{run_name}{epoch}_intermediate.json"
@@ -737,6 +766,7 @@ def main():
             "max_steps": args.max_steps,
             "webshop_wrapper": args.webshop_wrapper,
         })
+        summary.update(run_metadata)
         log_summary(summary)
 
         result_path = f"{results_dir}/{run_name}{epoch}.json"
