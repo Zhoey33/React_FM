@@ -426,6 +426,31 @@ ScienceWorld 现在只保留 `failure_recovery` 主链路:
 
 `question_text` 是旧兼容字段，新 ScienceWorld memory 不再生成或依赖它。
 
+### 6.4 当前 Memory 检索口径
+
+正式 ScienceWorld 主实验使用 `in_loop`:
+
+1. detector 在某一步标记 failure。
+2. runner 用该步 `action + observation` 检索同 `task_type` bucket 的 memory。
+3. 默认只注入 top-1 到下一步 prompt，下一步用完即清空。
+
+默认配置:
+
+- `agent.max_memory_inject: 1`
+- `memory.retrieval_top_k: 1`
+- `memory.min_score: 0.0`
+- `--retrieval-mode hybrid`
+
+`min_score=0.0` 表示先不强筛，只记录检索分数。failure event 会包含:
+
+- `retrieved_memory_scores`
+- `retrieval_candidate_count`
+- `retrieval_top_k`
+- `retrieval_min_score`
+- `retrieval_mode`
+
+这些字段用于 pilot 后判断阈值，不等同于 memory 生成阶段的 `confidence_score`。`episode` injection 暂时只作为 legacy/ablation，不作为正式 React-FM 主协议。
+
 ## 7. Post-Injection Correction 标注与统计
 
 用途:

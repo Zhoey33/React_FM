@@ -72,19 +72,21 @@
 - 每条 memory 存入同 task type bucket。
 - 检索 query 是 `failed_action | failure_observation`。
 - 默认 `retrieval_mode="hybrid"`，BM25 与 embedding 排名通过 RRF 融合。
-- `top_k` 默认 3，`min_score=0.0`。
+- 主实验固定 `in_loop`，默认只注入 top-1 memory。
+- `min_score=0.0` 为默认安全值，表示记录 retrieval score 但不强筛。
+- failure event 会记录 `retrieved_memory_scores / retrieval_candidate_count / retrieval_top_k / retrieval_min_score / retrieval_mode`。
 
 主要风险:
 
-- 只要同 task type bucket 非空，默认总会返回 top-k；没有相关性阈值，可能注入弱相关 memory。
+- `min_score=0.0` 时同 task type bucket 非空仍会返回 top-1；弱相关注入需要靠 pilot 后设置阈值控制。
 - task type 粒度仍然较粗，同一 task type 的不同 variation 可能共享过多局部经验。
-- 检索统计里的 `retrieval_hit` 当前更接近“bucket 非空且返回结果”，不等于“相关 memory 命中”。
+- 检索统计里的 `retrieval_hit` 当前更接近“返回了 memory”，不等于“相关 memory 命中”。
 
 建议:
 
 - 正式实验报告中区分 `retrieval_hit` 和人工标注的 memory relevance / post-injection correction。
 - 在小规模 pilot 上扫 `retrieval_mode` 与 `min_score`，再决定主实验是否保留 `min_score=0.0`。
-- 增加 retrieval unit tests: task_type 隔离、top_k、hybrid/rand/bm25 fallback、空 bucket。
+- `episode` injection 只作为 legacy/ablation，不作为 React-FM 主实验协议。
 
 ## 4. Prompt 拼接
 

@@ -1,6 +1,7 @@
 """Tests for wiring ScienceWorld implicit judge detection into the runner."""
 
 from experiments import run_scienceworld
+from src.memory import RetrievalResult
 from src.scienceworld_failure_detector import DetectionResult
 
 
@@ -55,10 +56,12 @@ class FakeMemory:
     def __init__(self):
         self.retrieve_calls = []
         self.add_calls = []
+        self.min_score = 0.25
+        self.retrieval_mode = "hybrid"
 
     def retrieve(self, **kwargs):
         self.retrieve_calls.append(kwargs)
-        return []
+        return RetrievalResult([], [], candidate_count=4)
 
     def add(self, **kwargs):
         self.add_calls.append(kwargs)
@@ -172,6 +175,7 @@ def test_judge_detected_failure_triggers_retrieval_and_enters_extraction(monkeyp
     assert step["failure_confidence"] == 0.9
 
     assert memory.retrieve_calls
+    assert memory.retrieve_calls[0]["return_scores"] is True
     assert captured["detected_failures"] == [
         {
             "step": 0,
@@ -192,3 +196,28 @@ def test_judge_detected_failure_triggers_retrieval_and_enters_extraction(monkeyp
     assert memory.add_calls[0]["source_episode_score"] == 0.0
     assert memory.add_calls[0]["confidence_score"] == 0.9
     assert "question_text" not in memory.add_calls[0]
+
+
+def test_retrieval_observability_fields_are_recorded_for_failure_step():
+    detector = FakeDetector()
+    memory = FakeMemory()
+    agent = run_scienceworld.ScienceWorldReActAgent(
+        llm=FakeLLM(),
+        memory_store=memory,
+        failure_detector=detector,
+        extractor_llm=None,
+        max_steps=1,
+        max_memory_inject=1,
+        enable_memory=True,
+        inject_mode="in_loop",
+    )
+
+    result = agent.run_episode(FakeEnv(), env_idx=7)
+
+    step = result["steps"][0]
+    assert step["retrieval_attempted"] is True
+    assert step["retrieval_mode"] == "hybrid"
+    assert step["retrieval_top_k"] == 1
+    assert step["retrieval_min_score"] == 0.25
+    assert step["retrieval_candidate_count"] == 4
+    assert step["retrieved_memory_scores"] == []

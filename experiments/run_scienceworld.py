@@ -23,7 +23,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.llm import LLMClient
-from src.memory import FailureMemoryStore
+from src.memory import FailureMemoryStore, RetrievalResult
 from src.scienceworld_failure_detector import ScienceWorldFailureDetector
 from src.scienceworld_env import ScienceWorldEnv, DEFAULT_EVAL_TASKS
 from src.scienceworld_failure_events import write_failure_events_jsonl
@@ -215,6 +215,13 @@ def _format_retrieved_memory_text(entries: list) -> str:
     return "\n".join(lines)
 
 
+def _unpack_retrieval_result(result) -> tuple[list, list[float], int]:
+    """Normalize scored and legacy memory retrieval return values."""
+    if isinstance(result, RetrievalResult):
+        return result.entries, result.rrf_scores, result.candidate_count
+    return result, [], len(result or [])
+
+
 class ScienceWorldReActAgent:
     """ReAct agent adapted for ScienceWorld."""
 
@@ -225,7 +232,7 @@ class ScienceWorldReActAgent:
         failure_detector: ScienceWorldFailureDetector | None = None,
         extractor_llm: LLMClient | None = None,
         max_steps: int = 50,
-        max_memory_inject: int = 3,
+        max_memory_inject: int = 1,
         enable_memory: bool = True,
         inject_mode: str = "in_loop",
         memory_style: str = "original",
@@ -360,7 +367,12 @@ class ScienceWorldReActAgent:
                 "is_think": False, "failure_detected": False, "failure_type": "",
                 "memory_retrieved": 0,
                 "retrieval_attempted": False,
+                "retrieval_mode": getattr(self.memory, "retrieval_mode", "") if self.memory else "",
+                "retrieval_top_k": self.max_memory_inject,
+                "retrieval_min_score": getattr(self.memory, "min_score", 0.0) if self.memory else 0.0,
+                "retrieval_candidate_count": 0,
                 "retrieved_memory_ids": [],
+                "retrieved_memory_scores": [],
                 "injected_memory_text": "",
                 "score_before_action": score_before_action,
                 "score_after_action": final_score,
@@ -396,11 +408,17 @@ class ScienceWorldReActAgent:
 
                     if self.inject_mode == "in_loop":
                         record["retrieval_attempted"] = True
-                        retrieved = self.memory.retrieve(
+                        retrieval_result = self.memory.retrieve(
                             query_action=action, query_observation=observation,
                             task_type=task_type, top_k=self.max_memory_inject, env_idx=env_idx,
+                            return_scores=True,
+                        )
+                        retrieved, retrieval_scores, candidate_count = _unpack_retrieval_result(
+                            retrieval_result
                         )
                         record["memory_retrieved"] = len(retrieved)
+                        record["retrieval_candidate_count"] = candidate_count
+                        record["retrieved_memory_scores"] = retrieval_scores
                         record["retrieved_memory_ids"] = [
                             entry.memory_id for entry in retrieved
                         ]
@@ -540,6 +558,7 @@ def main():
             embedding_model_name=config["memory"]["embedding_model"],
             max_entries=config["memory"]["max_entries"],
             top_k=config["memory"]["retrieval_top_k"],
+            min_score=config["memory"].get("min_score", 0.0),
             retrieval_mode=args.retrieval_mode,
             scope="task_type",
         )

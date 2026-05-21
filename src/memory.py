@@ -22,6 +22,7 @@ class RetrievalResult:
     """Result of a memory retrieval with RRF scores for the gate."""
     entries: list  # list[FailureMemoryEntry]
     rrf_scores: list[float]  # RRF score per returned entry (same order)
+    candidate_count: int = 0  # number of eligible candidates considered
 
     @property
     def top1_score(self) -> float:
@@ -311,6 +312,7 @@ class FailureMemoryStore:
             typed = [e for e in candidates if e.task_type == task_type]
             if typed:
                 candidates = typed
+        candidate_count = len(candidates)
 
         # Random retrieval mode
         if self.retrieval_mode == "random":
@@ -320,7 +322,11 @@ class FailureMemoryStore:
                 self.total_hits += 1
             if return_scores:
                 # Assign uniform pseudo-scores for random mode
-                return RetrievalResult(results, [1.0 / len(candidates)] * len(results))
+                return RetrievalResult(
+                    results,
+                    [1.0 / len(candidates)] * len(results),
+                    candidate_count=candidate_count,
+                )
             return results
 
         query_text = self._build_query_text(query_action, query_observation)
@@ -343,7 +349,7 @@ class FailureMemoryStore:
                     f"[{self._bucket_label()}={self._bucket_key(task_type=task_type, env_idx=env_idx)}, mode=bm25_only]"
                 )
             if return_scores:
-                return RetrievalResult(results, scores)
+                return RetrievalResult(results, scores, candidate_count=candidate_count)
             return results
 
         if self.retrieval_mode == "embedding_only":
@@ -364,7 +370,7 @@ class FailureMemoryStore:
                     f"[{self._bucket_label()}={self._bucket_key(task_type=task_type, env_idx=env_idx)}, mode=embedding_only]"
                 )
             if return_scores:
-                return RetrievalResult(results, scores)
+                return RetrievalResult(results, scores, candidate_count=candidate_count)
             return results
 
         # Default: hybrid RRF
@@ -418,7 +424,7 @@ class FailureMemoryStore:
             )
 
         if return_scores:
-            return RetrievalResult(results, result_rrf)
+            return RetrievalResult(results, result_rrf, candidate_count=candidate_count)
         return results
 
     def save(self, filepath: str) -> None:

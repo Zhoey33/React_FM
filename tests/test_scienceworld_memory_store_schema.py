@@ -1,10 +1,10 @@
-"""Tests for ScienceWorld memory provenance fields in the shared memory store."""
+"""Tests for ScienceWorld memory provenance and retrieval observability."""
 
 import json
 
 import numpy as np
 
-from src.memory import FailureMemoryStore
+from src.memory import FailureMemoryStore, RetrievalResult
 
 
 def test_memory_store_saves_and_loads_scienceworld_provenance_fields(tmp_path):
@@ -52,3 +52,43 @@ def test_memory_store_saves_and_loads_scienceworld_provenance_fields(tmp_path):
     assert loaded_entry.source_episode_success is False
     assert loaded_entry.source_episode_score == 35.0
     assert loaded_entry.confidence_score == 0.88
+
+
+def test_memory_retrieve_return_scores_tracks_top_k_and_candidate_count():
+    store = FailureMemoryStore(scope="task_type", retrieval_mode="hybrid", top_k=3)
+    store._embed = lambda text: np.array([1.0, 0.0], dtype=np.float32)
+
+    store.add("go to kitchen", "The door is not open.", "open door to kitchen", task_type="melt")
+    store.add("pick up pot", "You are not near the pot.", "go to kitchen", task_type="melt")
+
+    result = store.retrieve(
+        query_action="go to kitchen",
+        query_observation="The door is not open.",
+        task_type="melt",
+        top_k=1,
+        return_scores=True,
+    )
+
+    assert isinstance(result, RetrievalResult)
+    assert len(result.entries) == 1
+    assert len(result.rrf_scores) == 1
+    assert result.candidate_count == 2
+    assert result.rrf_scores[0] > 0
+
+
+def test_memory_retrieve_hybrid_min_score_filters_low_rrf_results():
+    store = FailureMemoryStore(scope="task_type", retrieval_mode="hybrid", top_k=3, min_score=1.0)
+    store._embed = lambda text: np.array([1.0, 0.0], dtype=np.float32)
+
+    store.add("go to kitchen", "The door is not open.", "open door to kitchen", task_type="melt")
+
+    result = store.retrieve(
+        query_action="go to kitchen",
+        query_observation="The door is not open.",
+        task_type="melt",
+        return_scores=True,
+    )
+
+    assert result.entries == []
+    assert result.rrf_scores == []
+    assert result.candidate_count == 1

@@ -59,6 +59,9 @@ ScienceWorld memory 的主作用域固定为 `task_type`:
 - 不做 topic fallback。
 - 不做 global fallback。
 - 没有同 task type 命中时返回空 memory。
+- 主实验只使用 `in_loop` 检索；`episode` injection 仅保留为 legacy/ablation。
+- 默认注入 top-1；`memory.min_score=0.0` 表示记录 retrieval score 但不强筛。
+- failure event 记录 retrieval score、候选数、top-k、阈值和 retrieval mode，供 pilot 后设定阈值。
 
 正式 memory item 使用 failure-recovery 结构，优先保留:
 
