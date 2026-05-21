@@ -97,23 +97,23 @@
 
 当前实现:
 
-- baseline prompt: few-shot + task observation + full history。
-- React-FM prompt: few-shot + memory section + task observation + full history。
-- in-loop memory 在 detector 触发后只注入下一步 prompt，随后 `current_retrieved=None` 清空。
-- memory style 支持 `original / factual / reflexion / hint`。
+- baseline prompt: few-shot + task observation + recent history。
+- React-FM 主 prompt: few-shot + task observation + recent history + previous failure block + retrieved repair memory。
+- `agent.prompt_history_window=10`，baseline 和 React-FM 使用同一 history window。
+- in-loop memory 在 detector 触发并成功检索 memory 后只注入下一步 prompt，随后清空。
+- `episode` injection 仍保留旧 memory style，仅作为 legacy/ablation。
 
 主要风险:
 
-- history 不截断，100 step ScienceWorld episode 会把完整 observation 全塞进 prompt，成本和上下文噪声都可能很高。
-- memory section 位于 task observation 之前，且没有显式说明“这是针对上一条失败 action 的建议”。
-- 没有 applicability decision，模型可能盲用或忽略 memory。
-- `hint` style 对 tiered memory 取的是第一行 `[Strategy]`，不是最直接的 `[Next action]`。
+- 默认 10 步 history 可能仍会丢失更早的关键物品/位置线索，需要 pilot 观察失败类型。
+- few-shot examples 仍只有 `matter/default` 两类，部分任务的示例技能不够贴合。
+- `episode` mode 不是主协议，不应用于正式 React-FM 主结果。
 
 建议:
 
-- 正式实验前至少做 prompt snapshot test，固定 baseline / in-loop / episode 三种 prompt 结构。
-- 对正式主实验使用一个固定 prompt policy: `task goal + recent history + failure signal + retrieved memory + action cue`。
-- 若不马上重构，至少在论文和日志中说明当前 memory 是 one-step injection，而不是持续 episode-level guidance。
+- 已新增 prompt snapshot tests，固定 baseline / in-loop-with-memory / one-step injection 行为。
+- 正式主实验使用固定 prompt policy: `task goal + recent history + failure signal + retrieved memory + action cue`。
+- 后续如要调 prompt，只能在新 run protocol 中显式记录 prompt 版本。
 
 ## 5. 实验前必须确认
 
@@ -121,7 +121,7 @@
 
 1. 明确 detector 口径: 默认 rule + LLM judge；如需 rule-only 对照，使用关闭开关单独跑。
 2. 保持 ScienceWorld memory format 为 `failure_recovery`，不混入其它 benchmark 的 memory ablation 分支。
-3. 增加 prompt snapshot tests，避免后续改 prompt 时结果不可比。
+3. 使用 prompt snapshot tests 防止正式重跑前 prompt 漂移。
 4. 用已实现的三类质量脚本做 pilot:
    - detector quality
    - memory generation quality

@@ -238,6 +238,7 @@ class ScienceWorldReActAgent:
         memory_style: str = "original",
         memory_format: str = "failure_recovery",
         baseline_mode: bool = False,
+        prompt_history_window: int = 10,
     ):
         self.llm = llm
         self.memory = memory_store
@@ -250,6 +251,13 @@ class ScienceWorldReActAgent:
         self.inject_mode = inject_mode
         self.memory_style = memory_style
         self.memory_format = memory_format
+        self.prompt_history_window = prompt_history_window
+
+    def _prompt_history(self, history: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Return the recent history slice used in ScienceWorld prompts."""
+        if self.prompt_history_window <= 0:
+            return history
+        return history[-self.prompt_history_window:]
 
     def run_episode(self, env, env_idx: int = 0) -> dict:
         """Run one ScienceWorld episode. Returns result dict."""
@@ -279,6 +287,7 @@ class ScienceWorldReActAgent:
         final_score = 0.0
 
         current_retrieved = None
+        current_failure_context = None
         failures_detected = 0
         memories_retrieved_total = 0
         consecutive_thinks = 0
@@ -296,19 +305,20 @@ class ScienceWorldReActAgent:
                 prompt = build_baseline_user_prompt(
                     task_type=task_type,
                     task_obs=init_obs,
-                    history=history,
+                    history=self._prompt_history(history),
                 )
                 system_prompt = SYSTEM_PROMPT_BASE
             elif self.inject_mode == "episode":
                 prompt = build_user_prompt(
-                    task_type=task_type, task_obs=init_obs, history=history,
+                    task_type=task_type, task_obs=init_obs, history=self._prompt_history(history),
                     retrieved_memories=episode_memories, memory_style=self.memory_style,
                 )
                 system_prompt = SYSTEM_PROMPT_FM
             else:
                 prompt = build_user_prompt(
-                    task_type=task_type, task_obs=init_obs, history=history,
+                    task_type=task_type, task_obs=init_obs, history=self._prompt_history(history),
                     retrieved_memories=current_retrieved, memory_style=self.memory_style,
+                    failure_context=current_failure_context,
                 )
                 system_prompt = SYSTEM_PROMPT_FM
 
@@ -320,6 +330,7 @@ class ScienceWorldReActAgent:
 
             if self.inject_mode == "in_loop":
                 current_retrieved = None
+                current_failure_context = None
 
             if action.startswith("> "):
                 action = action[2:]
@@ -426,6 +437,13 @@ class ScienceWorldReActAgent:
                         memories_retrieved_total += len(retrieved)
                         if retrieved:
                             current_retrieved = retrieved
+                            current_failure_context = {
+                                "action": action,
+                                "observation": observation,
+                                "failure_type": det.failure_type,
+                                "detector_source": det.detector_source,
+                                "failure_reason": det.reason,
+                            }
                             logger.info(f"    Retrieved {len(retrieved)} memories")
 
             steps.append(record)
@@ -605,6 +623,7 @@ def main():
         memory_style=args.memory_style,
         memory_format=args.memory_format,
         baseline_mode=is_baseline,
+        prompt_history_window=config["agent"].get("prompt_history_window", 10),
     )
 
     task_names = args.tasks or DEFAULT_EVAL_TASKS

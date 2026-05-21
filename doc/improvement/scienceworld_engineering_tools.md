@@ -451,6 +451,28 @@ ScienceWorld 现在只保留 `failure_recovery` 主链路:
 
 这些字段用于 pilot 后判断阈值，不等同于 memory 生成阶段的 `confidence_score`。`episode` injection 暂时只作为 legacy/ablation，不作为正式 React-FM 主协议。
 
+### 6.5 当前 Prompt 拼接口径
+
+正式 ScienceWorld 主实验使用固定 in-loop prompt:
+
+```text
+few-shot example
+Here is the task.
+task observation
+recent history
+previous failure block
+retrieved repair memory
+>
+```
+
+默认配置:
+
+- `agent.prompt_history_window: 10`
+
+previous failure block 只在成功检索到 memory 后的下一步出现，字段包括 failed action、failure observation、failure type、detector source/reason。retrieved repair memory 使用 past failed action、past failure observation、repair strategy、repair plan、suggested next action。
+
+prompt 中不注入 `question_text`、retrieval score 或 memory `confidence_score`。`tests/test_scienceworld_prompt_construction.py` 固定 baseline、in-loop memory 和一次性清空行为，避免正式重跑前 prompt 悄悄漂移。
+
 ## 7. Post-Injection Correction 标注与统计
 
 用途:

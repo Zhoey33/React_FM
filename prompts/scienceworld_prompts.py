@@ -69,6 +69,41 @@ def format_step(action: str, observation: str) -> str:
     return f"> {action}\n{observation}\n"
 
 
+def _format_fixed_memory_block(retrieved_memories: list, failure_context: dict) -> str:
+    """Format the ScienceWorld in-loop repair block used by the main protocol."""
+    lines = [
+        "Previous action appears to have failed.",
+        f"Failed action: {failure_context.get('action', '')}",
+        f"Failure observation: {failure_context.get('observation', '')}",
+        f"Failure type: {failure_context.get('failure_type', '')}",
+        f"Detector source: {failure_context.get('detector_source', '')}",
+    ]
+    reason = failure_context.get("failure_reason", "")
+    if reason:
+        lines.append(f"Detector reason: {reason}")
+
+    lines.append("")
+    lines.append("Retrieved repair memory:")
+    for entry in retrieved_memories:
+        lines.extend(
+            [
+                f"Past failed action: {entry.failure_action}",
+                f"Past failure observation: {entry.failure_observation}",
+                f"Repair strategy: {getattr(entry, 'repair_strategy', '') or entry.solution_action}",
+            ]
+        )
+        if getattr(entry, "repair_tactic", ""):
+            lines.append(f"Repair plan: {entry.repair_tactic}")
+        if getattr(entry, "repair_action", ""):
+            lines.append(f"Suggested next action: {entry.repair_action}")
+        else:
+            lines.append(f"Suggested next action: {entry.solution_action}")
+
+    lines.append("")
+    lines.append("Use the memory only if it applies to the current state. Output one valid next action.")
+    return "\n".join(lines)
+
+
 def build_baseline_user_prompt(
     task_type: str,
     task_obs: str,
@@ -96,8 +131,23 @@ def build_user_prompt(
     retrieved_memories: list | None = None,
     memory_style: str = "original",
     hint_text: str | None = None,
+    failure_context: dict | None = None,
 ) -> str:
     """Build user prompt for ScienceWorld, matching ALFWorld interface."""
+    if retrieved_memories and failure_context:
+        sections = [
+            get_fewshot_examples(task_type),
+            "Here is the task.\n" + task_obs,
+        ]
+        prompt = "\n\n".join(sections) + "\n"
+        for action, obs in history:
+            prompt += format_step(action, obs)
+        prompt += "\n" + _format_fixed_memory_block(retrieved_memories, failure_context) + "\n"
+        if hint_text:
+            prompt += f"\n{hint_text}\n"
+        prompt += "> "
+        return prompt
+
     sections = []
 
     # Few-shot example

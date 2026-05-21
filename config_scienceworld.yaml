@@ -20,6 +20,7 @@ extractor:
 agent:
   max_steps: 100
   max_memory_inject: 1
+  prompt_history_window: 10
   enable_memory: true
 
 memory:

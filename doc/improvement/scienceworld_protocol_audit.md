@@ -62,6 +62,7 @@ ScienceWorld memory 的主作用域固定为 `task_type`:
 - 主实验只使用 `in_loop` 检索；`episode` injection 仅保留为 legacy/ablation。
 - 默认注入 top-1；`memory.min_score=0.0` 表示记录 retrieval score 但不强筛。
 - failure event 记录 retrieval score、候选数、top-k、阈值和 retrieval mode，供 pilot 后设定阈值。
+- prompt 默认只保留最近 10 步 history；成功检索 memory 后，下一步 prompt 注入上一条 failure signal 和 retrieved repair memory，用完即清空。
 
 正式 memory item 使用 failure-recovery 结构，优先保留:
 
