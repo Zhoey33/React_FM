@@ -267,7 +267,134 @@ python analysis/scienceworld_detector_quality.py summarize \
 - `false_positive_rate = FP / (FP + TN)`。
 - `false_negative_rate = FN / (FN + TP)`。
 
-## 6. 建议使用顺序
+## 6. Memory Generation Quality 标注与统计
+
+用途:
+
+- 评估 memory extractor 生成的 memory entry 是否准确、可用、可执行。
+- 输入是 memory store JSON，不改 runner，也不改 memory store schema。
+- v1 只做人工标注模板和统计，不调用 LLM 自动判定。
+
+### 6.1 生成标注模板
+
+命令:
+
+```bash
+python analysis/scienceworld_memory_quality.py make-template \
+  memory_store/.../sw_epoch1.json \
+  --output analysis/memory_quality_annotations.jsonl \
+  --max-samples 100 \
+  --seed 0
+```
+
+如需补充 memory 来源 episode 的成功状态和 raw score:
+
+```bash
+python analysis/scienceworld_memory_quality.py make-template \
+  memory_store/.../sw_epoch1.json \
+  --result-json results/.../sw_result.json \
+  --output analysis/memory_quality_annotations.jsonl \
+  --max-samples 100 \
+  --seed 0
+```
+
+说明:
+
+- 支持当前 `scope/buckets` 格式，也兼容 legacy `task_types` / `envs`。
+- 自动忽略 `embedding`，避免标注文件过大。
+- 默认按 `task_type` 尽量均衡采样。
+- `--seed` 固定后，抽样结果可复现。
+
+模板自动字段:
+
+```json
+{
+  "sample_id": "sw_memory_0001",
+  "source_file": "memory_store/.../sw_epoch1.json",
+  "memory_id": 12,
+  "bucket": "melt",
+  "scope": "task_type",
+  "task_type": "melt",
+  "env_idx": 7,
+  "created_at": "2026-04-01T00:00:00",
+  "failure_action": "go to kitchen",
+  "failure_observation": "The door is not open.",
+  "solution_action": "open door to kitchen -> go to kitchen",
+  "repair_strategy": "Open blocked doors before moving.",
+  "repair_tactic": "Open the specific door, then retry movement.",
+  "repair_action": "open door to kitchen -> go to kitchen",
+  "question_text": "What precondition is missing?",
+  "source_episode_success": true,
+  "source_episode_score": 100.0
+}
+```
+
+人工填写字段:
+
+- `quality_label`: `high_quality` / `usable_but_weak` / `invalid` / `duplicate_or_redundant`。
+- `failure_action_accurate`: failure action 是否准确。
+- `failure_observation_has_evidence`: observation 是否提供了足够失败证据。
+- `repair_strategy_reasonable`: strategy 是否合理。
+- `repair_action_executable`: repair action 是否能在环境中执行。
+- `overly_state_bound`: memory 是否过度绑定某个具体状态，难以泛化。
+- `annotation_notes`: 简短备注。
+
+布尔字段可填 `true/false`、`yes/no`、`1/0`。
+
+### 6.2 统计标注结果
+
+命令:
+
+```bash
+python analysis/scienceworld_memory_quality.py summarize \
+  analysis/memory_quality_annotations.jsonl \
+  --output analysis/memory_quality_summary.json
+```
+
+如果还有未标注行，默认报错。想临时跳过:
+
+```bash
+python analysis/scienceworld_memory_quality.py summarize \
+  analysis/memory_quality_annotations.jsonl \
+  --output analysis/memory_quality_summary.json \
+  --allow-unlabeled
+```
+
+输出包含:
+
+- `overall`
+- `by_task_type`
+- `by_quality_label`
+- `by_source_episode_success`
+
+每组重点字段:
+
+```json
+{
+  "total_memories": 100,
+  "high_quality_count": 35,
+  "usable_but_weak_count": 40,
+  "invalid_count": 15,
+  "duplicate_or_redundant_count": 10,
+  "usable_rate": 0.75,
+  "invalid_rate": 0.15,
+  "duplicate_rate": 0.1,
+  "failure_action_accuracy": 0.82,
+  "failure_observation_evidence_rate": 0.78,
+  "repair_strategy_reasonable_rate": 0.73,
+  "repair_action_executable_rate": 0.68,
+  "overly_state_bound_rate": 0.22
+}
+```
+
+解读:
+
+- `usable_rate = high_quality + usable_but_weak`。
+- `invalid_rate` 越高，说明 extractor 生成了更多不可用 memory。
+- `duplicate_rate` 反映冗余记忆比例。
+- `overly_state_bound_rate` 越高，说明 memory 更像轨迹片段，泛化性可能较差。
+
+## 7. 建议使用顺序
 
 1. 对旧结果先跑 raw 指标重算:
 
@@ -301,7 +428,25 @@ python analysis/scienceworld_detector_quality.py summarize \
   --output analysis/detector_quality_summary.json
 ```
 
-## 7. 当前完成状态
+6. 从 memory store 抽 memory quality 标注模板:
+
+```bash
+python analysis/scienceworld_memory_quality.py make-template memory_store/.../sw_epoch1.json \
+  --result-json results/.../sw_result.json \
+  --output analysis/memory_quality_annotations.jsonl \
+  --max-samples 100 \
+  --seed 0
+```
+
+7. 人工标注后统计 memory quality:
+
+```bash
+python analysis/scienceworld_memory_quality.py summarize \
+  analysis/memory_quality_annotations.jsonl \
+  --output analysis/memory_quality_summary.json
+```
+
+## 8. 当前完成状态
 
 已完成:
 
@@ -310,9 +455,9 @@ python analysis/scienceworld_detector_quality.py summarize \
 - failure-event JSONL 生成。
 - recovered@1 / recovered@3 统计脚本。
 - detector quality 标注模板与统计脚本。
+- memory generation quality 标注模板与统计脚本。
 
 下一步:
 
-- memory generation quality 标注/统计脚本。
 - post-injection correction 标注/统计脚本。
 - context construction 优化。
