@@ -1,7 +1,7 @@
-"""ToolBench (StableToolBench) environment wrapper.
+"""ToolBench (StableToolBench) official-server environment adapter.
 
 Loads solvable queries, provides tool definitions as function schemas,
-executes API calls via local cache lookup with LLM fallback.
+and executes API calls through the StableToolBench virtual server.
 """
 
 import json
@@ -9,6 +9,14 @@ import logging
 import os
 import re
 from pathlib import Path
+
+import requests
+
+from src.stabletoolbench_official import (
+    official_function_schemas,
+    official_tool_metadata,
+    parse_action_call,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,96 +34,8 @@ def _standardize(name: str) -> str:
 
 
 def _load_tool_definitions(api_list: list[dict]) -> list[dict]:
-    """Load full tool definitions for the APIs in a query."""
-    tools = []
-    seen = set()
-    for api_info in api_list:
-        cat = api_info["category_name"]
-        tool_name = api_info["tool_name"]
-        api_name = api_info["api_name"]
-        key = f"{cat}/{tool_name}/{api_name}"
-        if key in seen:
-            continue
-        seen.add(key)
-
-        # Load tool JSON
-        std_tool = _standardize(tool_name)
-        tool_path = _TOOLS_DIR / cat / f"{std_tool}.json"
-        if not tool_path.exists():
-            # Try with category suffix
-            for f in (_TOOLS_DIR / cat).glob("*.json"):
-                if _standardize(f.stem) == std_tool:
-                    tool_path = f
-                    break
-
-        if not tool_path.exists():
-            logger.warning(f"Tool definition not found: {tool_path}")
-            continue
-
-        with open(tool_path) as f:
-            tool_data = json.load(f)
-
-        # Find the specific API
-        for api in tool_data.get("api_list", []):
-            if api["name"] == api_name or _standardize(api["name"]) == _standardize(api_name):
-                func_name = f"{_standardize(api_name)}_for_{_standardize(tool_name)}"
-                params = {}
-                required = []
-                for p in api.get("required_parameters", []):
-                    params[p["name"]] = {
-                        "type": p.get("type", "string").lower(),
-                        "description": p.get("description", ""),
-                    }
-                    required.append(p["name"])
-                for p in api.get("optional_parameters", []):
-                    params[p["name"]] = {
-                        "type": p.get("type", "string").lower(),
-                        "description": p.get("description", ""),
-                    }
-                tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": func_name,
-                        "description": f"{api.get('description', '')} (from {tool_name})",
-                        "parameters": {
-                            "type": "object",
-                            "properties": params,
-                            "required": required,
-                        },
-                    },
-                    "_meta": {
-                        "category": cat,
-                        "tool_name": tool_name,
-                        "api_name": api_name,
-                        "std_tool": std_tool,
-                        "std_api": _standardize(api_name),
-                    },
-                })
-                break
-    # Add Finish tool
-    tools.append({
-        "type": "function",
-        "function": {
-            "name": "Finish",
-            "description": "Submit your final answer to the user's question.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "return_type": {
-                        "type": "string",
-                        "description": "give_answer or give_up_and_restart",
-                    },
-                    "final_answer": {
-                        "type": "string",
-                        "description": "The final answer to the user's question.",
-                    },
-                },
-                "required": ["return_type", "final_answer"],
-            },
-        },
-        "_meta": None,
-    })
-    return tools
+    """Build official StableToolBench function schemas for a query."""
+    return official_function_schemas(api_list, include_finish=True)
 
 
 def _lookup_cache(category: str, tool_name: str, api_name: str, tool_input: dict) -> dict | None:
@@ -153,13 +73,25 @@ class ToolBenchEnv:
         subsets: list[str] | None = None,
         max_queries: int | None = None,
         fallback_llm=None,
+        api_mode: str = "server",
+        service_url: str | None = None,
+        toolbench_key: str | None = None,
+        max_observation_length: int = 1024,
+        observ_compress_method: str = "truncate",
     ):
+        if api_mode not in {"server", "cache"}:
+            raise ValueError(f"Unsupported ToolBench api_mode: {api_mode}")
         self.subsets = subsets or [
             "G1_instruction", "G1_category", "G1_tool",
             "G2_instruction", "G2_category", "G3_instruction",
         ]
         self.max_queries = max_queries
         self.fallback_llm = fallback_llm  # LLMClient for cache miss simulation
+        self.api_mode = api_mode
+        self.service_url = service_url or os.environ.get("SERVICE_URL", "http://localhost:8080/virtual")
+        self.toolbench_key = toolbench_key if toolbench_key is not None else os.environ.get("TOOLBENCH_KEY", "")
+        self.max_observation_length = max_observation_length
+        self.observ_compress_method = observ_compress_method
         self._queries = []
         self._idx = 0
         self._current = None
@@ -199,10 +131,8 @@ class ToolBenchEnv:
 
         # Load tool definitions
         self._tools = _load_tool_definitions(self._current["api_list"])
-        self._tool_meta = {}
-        for t in self._tools:
-            name = t["function"]["name"]
-            self._tool_meta[name] = t.get("_meta")
+        self._tool_meta = official_tool_metadata(self._current["api_list"])
+        self._tool_meta["Finish"] = None
 
         query = self._current["query"]
         subset = self._current.get("_subset", "unknown")
@@ -211,12 +141,11 @@ class ToolBenchEnv:
         # Build tool descriptions for the prompt
         tool_descs = []
         for t in self._tools:
-            func = t["function"]
-            if func["name"] == "Finish":
+            if t["name"] == "Finish":
                 continue
-            params = func["parameters"].get("properties", {})
+            params = t["parameters"].get("properties", {})
             param_str = ", ".join(f"{k}: {v.get('type', 'str')}" for k, v in params.items())
-            tool_descs.append(f"- {func['name']}({param_str}): {func['description']}")
+            tool_descs.append(f"- {t['name']}({param_str}): {t['description']}")
 
         obs = f"Task: {query}\n\nAvailable APIs:\n" + "\n".join(tool_descs)
         obs += "\n- Finish(return_type, final_answer): Submit your final answer."
@@ -260,9 +189,18 @@ class ToolBenchEnv:
         if meta is None:
             return f"Unknown function: {func_name}. Check available APIs.", 0.0, False, {}
 
-        # Try cache lookup
+        if self.api_mode == "server":
+            obs, status_code = self._call_official_server(meta, params)
+            self._history.append((func_name, params, obs))
+            return obs, 0.0, False, {
+                "official_server": True,
+                "status_code": status_code,
+                "tool_meta": meta,
+            }
+
+        # Debug-only cache lookup.
         cached = _lookup_cache(
-            meta["category"], meta["tool_name"], meta["api_name"], params,
+            meta["category"], meta["original_tool_name"], meta["original_api_name"], params,
         )
         if cached is not None:
             obs = self._format_response(cached)
@@ -281,55 +219,60 @@ class ToolBenchEnv:
 
     def _parse_action(self, action: str) -> tuple[str | None, dict]:
         """Parse action string into (func_name, params)."""
-        # Extract function name
-        m = re.match(r'(\w+)\(', action)
-        if m:
-            func_name = m.group(1)
-            # Find matching closing paren (outermost)
-            start = m.end() - 1  # position of '('
-            depth = 0
-            end = -1
-            for i in range(start, len(action)):
-                if action[i] == '(':
-                    depth += 1
-                elif action[i] == ')':
-                    depth -= 1
-                    if depth == 0:
-                        end = i
-                        break
-            if end > start:
-                inner = action[start + 1:end]
-                try:
-                    params = json.loads(inner)
-                    return func_name, params
-                except json.JSONDecodeError:
-                    # Try as Finish(give_answer, text)
-                    if func_name == "Finish":
-                        parts = inner.split(",", 1)
-                        return "Finish", {
-                            "return_type": parts[0].strip().strip('"\''),
-                            "final_answer": parts[1].strip().strip('"\'') if len(parts) > 1 else "",
-                        }
-                    return func_name, {}
+        func_name, params, _ = parse_action_call(action)
+        return func_name, params
 
-        # Format 2: Action: func_name\nAction Input: {"key": "value"}
-        lines = action.split("\n")
-        func_name = None
-        params_str = ""
-        for line in lines:
-            line = line.strip()
-            if line.lower().startswith("action:"):
-                func_name = line[len("action:"):].strip()
-            elif line.lower().startswith("action input:"):
-                params_str = line[len("action input:"):].strip()
-        if func_name:
-            try:
-                params = json.loads(params_str) if params_str else {}
-            except json.JSONDecodeError:
-                params = {}
-            return func_name, params
+    def _call_official_server(self, meta: dict, params: dict) -> tuple[str, int]:
+        """Call the StableToolBench official virtual API endpoint."""
+        payload = {
+            "category": meta["category"],
+            "tool_name": meta["tool_name"],
+            "api_name": meta["api_name"],
+            "tool_input": json.dumps(params, ensure_ascii=False),
+            "strip": self.observ_compress_method,
+            "toolbench_key": self.toolbench_key,
+        }
+        headers = {"toolbench_key": self.toolbench_key}
+        timeout = None if self.service_url.endswith("virtual") else 15
+        try:
+            response = requests.post(self.service_url, json=payload, headers=headers, timeout=timeout)
+        except requests.exceptions.Timeout:
+            return json.dumps({"error": "Timeout error...", "response": ""}), 5
+        except requests.RequestException as exc:
+            return json.dumps({"error": f"request failed: {exc}", "response": ""}), 12
 
-        return None, {}
+        if response.status_code != 200:
+            return json.dumps(
+                {"error": f"request invalid, data error. status_code={response.status_code}", "response": ""},
+                ensure_ascii=False,
+            ), 12
+        try:
+            data = response.json()
+        except ValueError:
+            return json.dumps({"error": "request invalid, data error", "response": ""}), 12
+
+        obs = json.dumps(data, ensure_ascii=False)
+        if len(obs) > self.max_observation_length:
+            obs = obs[:self.max_observation_length] + "..."
+        return obs, self._official_status_code(data)
+
+    @staticmethod
+    def _official_status_code(response: dict) -> int:
+        """Map StableToolBench virtual-server errors to official status codes."""
+        error = response.get("error", "")
+        if error == "API not working error...":
+            return 6
+        if error == "Unauthorized error...":
+            return 7
+        if error == "Unsubscribed error...":
+            return 8
+        if error == "Too many requests error...":
+            return 9
+        if error == "Rate limit per minute error...":
+            return 10
+        if error == "Message error...":
+            return 11
+        return 0
 
     def _format_response(self, cached: dict) -> str:
         """Format cached API response."""

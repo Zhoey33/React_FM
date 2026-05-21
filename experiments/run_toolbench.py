@@ -1,4 +1,4 @@
-"""Run React_FM (or baseline ReAct) on ToolBench (StableToolBench)."""
+"""Run React_FM or ReAct on StableToolBench with official-format outputs."""
 
 import os
 os.environ["HF_HUB_OFFLINE"] = "1"
@@ -23,6 +23,12 @@ from src.memory import FailureMemoryStore
 from src.toolbench_failure_detector import ToolBenchFailureDetector
 from src.toolbench_env import ToolBenchEnv
 from src.log_utils import setup_logging
+from src.stabletoolbench_official import (
+    build_raw_answer_record,
+    run_official_converter,
+    run_official_pass_rate_eval,
+    write_raw_answer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +51,24 @@ def parse_args():
                         help="Enable cross-env memory sharing (retrieve from all envs)")
     parser.add_argument("--max-steps", type=int, default=10)
     parser.add_argument("--subsets", nargs="+", default=None)
+    parser.add_argument("--toolbench-api-mode", choices=["server", "cache"], default="server",
+                        help="server is the official StableToolBench protocol; cache is debug-only")
+    parser.add_argument("--service-url", default=None,
+                        help="StableToolBench virtual server URL, default from SERVICE_URL or localhost")
+    parser.add_argument("--toolbench-key", default=None,
+                        help="ToolBench key, default from TOOLBENCH_KEY")
+    parser.add_argument("--official-output-root", default="data/StableToolBench/data",
+                        help="Root containing answer/model_predictions_converted/pass_rate_results")
+    parser.add_argument("--official-model-name", default=None,
+                        help="Model directory name for official StableToolBench outputs")
+    parser.add_argument("--official-method", default=None,
+                        help="Method suffix for official raw answer filenames")
+    parser.add_argument("--skip-official-convert", action="store_true",
+                        help="Do not run official convert_to_answer_format.py after each epoch")
+    parser.add_argument("--official-eval", action="store_true",
+                        help="Run official eval_pass_rate.py after conversion")
+    parser.add_argument("--evaluate-times", type=int, default=3,
+                        help="StableToolEval repeated evaluation count")
     return parser.parse_args()
 
 
@@ -61,7 +85,7 @@ def save_results(results: list[dict], summary: dict, filepath: str):
 
 def compute_summary(results: list[dict], memory_stats: dict, mode: str) -> dict:
     total = len(results)
-    successes = sum(1 for r in results if r.get("success"))
+    finishes = sum(1 for r in results if r.get("submitted_final_answer", r.get("success")))
     total_tokens = sum(r.get("total_tokens", 0) for r in results)
     agent_tokens = sum(r.get("agent_tokens", r.get("total_tokens", 0)) for r in results)
     judge_tokens = sum(r.get("judge_tokens", 0) for r in results)
@@ -70,18 +94,23 @@ def compute_summary(results: list[dict], memory_stats: dict, mode: str) -> dict:
     for r in results:
         s = r.get("subset", "unknown")
         if s not in by_subset:
-            by_subset[s] = {"total": 0, "success": 0}
+            by_subset[s] = {"total": 0, "finished": 0}
         by_subset[s]["total"] += 1
-        if r.get("success"):
-            by_subset[s]["success"] += 1
+        if r.get("submitted_final_answer", r.get("success")):
+            by_subset[s]["finished"] += 1
     for v in by_subset.values():
-        v["rate"] = round(v["success"] / v["total"], 4) if v["total"] > 0 else 0
+        v["finish_rate"] = round(v["finished"] / v["total"], 4) if v["total"] > 0 else 0
     return {
         "mode": mode,
         "benchmark": "toolbench",
         "total_envs": total,
-        "total_success": successes,
-        "success_rate": round(successes / total, 4) if total > 0 else 0,
+        "total_finished": finishes,
+        "finish_rate": round(finishes / total, 4) if total > 0 else 0,
+        "submission_rate": round(finishes / total, 4) if total > 0 else 0,
+        "success_definition": (
+            "debug only: Finish(return_type=give_answer) with non-empty final_answer; "
+            "official ToolBench pass must come from StableToolEval SoPR/FAC"
+        ),
         "by_subset": by_subset,
         "total_tokens": total_tokens,
         "agent_tokens": agent_tokens,
@@ -203,7 +232,7 @@ class ToolBenchReActAgent:
 
             record = {
                 "step": step_num, "thought": thought, "action": action,
-                "observation": observation[:300],
+                "observation": observation,
                 "failure_detected": False, "memory_retrieved": 0,
             }
 
@@ -263,9 +292,12 @@ class ToolBenchReActAgent:
             "env_idx": env_idx,
             "subset": info.get("subset", ""),
             "query_id": info.get("query_id", ""),
-            "query": info["query"][:200],
-            "final_answer": final_answer[:200],
+            "query": info["query"],
+            "final_answer": final_answer,
+            "submitted_final_answer": success,
             "success": success,
+            "official_functions": info.get("tools", []),
+            "official_steps": steps,
             "total_steps": len(steps),
             "total_tokens": total_tokens,
             "agent_tokens": agent_stats["total_tokens"],
@@ -295,10 +327,16 @@ def main():
     is_baseline = args.baseline
     mode = "react_baseline" if is_baseline else "react_fm"
     run_name = args.run_name or f"tb_{mode}_"
+    official_method = args.official_method or ("ReAct_CoT@1" if is_baseline else "ReactFM_CoT@1")
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     results_dir = f"{config['experiment']['results_dir']}/{timestamp}"
     memory_dir = f"{config['memory']['persist_dir']}/{timestamp}" if not is_baseline else None
+    official_model_name = args.official_model_name or f"{run_name.rstrip('_')}_{timestamp}"
+    official_root = Path(args.official_output_root)
+    raw_answer_root = official_root / "answer" / official_model_name
+    converted_root = official_root / "model_predictions_converted" / official_model_name
+    pass_rate_root = official_root / "pass_rate_results" / official_model_name
 
     setup_logging(
         log_level=config["experiment"]["log_level"],
@@ -373,6 +411,9 @@ def main():
         env = ToolBenchEnv(
             subsets=args.subsets,
             max_queries=max_envs,
+            api_mode=args.toolbench_api_mode,
+            service_url=args.service_url,
+            toolbench_key=args.toolbench_key,
         )
         env.setup()
 
@@ -386,7 +427,8 @@ def main():
                     env.skip()
                     episode_results.append({
                         "env_idx": env_count, "subset": "", "query_id": "",
-                        "query": "", "final_answer": "", "success": True,
+                        "query": "", "final_answer": "", "submitted_final_answer": True, "success": True,
+                        "official_functions": [], "official_steps": [],
                         "total_steps": 0, "total_tokens": 0,
                         "agent_tokens": 0, "judge_tokens": 0, "extractor_tokens": 0,
                         "failures_detected": 0, "memories_retrieved": 0,
@@ -398,6 +440,22 @@ def main():
 
                 result = agent.run_episode(env, env_idx=env_count)
                 episode_results.append(result)
+                if result.get("query_id") and result.get("subset"):
+                    raw_record = build_raw_answer_record(
+                        query=result["query"],
+                        functions=result.get("official_functions", []),
+                        method=official_method,
+                        steps=result.get("official_steps", []),
+                        final_answer=result.get("final_answer", ""),
+                        total_tokens=result.get("agent_tokens", 0),
+                    )
+                    raw_path = write_raw_answer(
+                        raw_record,
+                        raw_answer_root / result["subset"],
+                        result["query_id"],
+                        official_method,
+                    )
+                    result["official_raw_answer_path"] = str(raw_path)
 
                 if result["success"]:
                     env_success[env_count] = True
@@ -428,10 +486,10 @@ def main():
 
         mem_stats = memory_store.stats() if memory_store else {}
         summary = compute_summary(episode_results, mem_stats, mode)
-        logger.info(f"  Epoch {epoch}: {summary['total_success']}/{summary['total_envs']} "
-                    f"({summary['success_rate']:.1%})")
+        logger.info(f"  Epoch {epoch}: debug Finish {summary['total_finished']}/{summary['total_envs']} "
+                    f"({summary['finish_rate']:.1%})")
         for s, stats in sorted(summary.get("by_subset", {}).items()):
-            logger.info(f"    {s:<20} {stats['success']}/{stats['total']} ({stats['rate']:.1%})")
+            logger.info(f"    {s:<20} {stats['finished']}/{stats['total']} ({stats['finish_rate']:.1%})")
 
         result_path = f"{results_dir}/{run_name}{epoch}.json"
         save_results(episode_results, summary, result_path)
@@ -441,6 +499,24 @@ def main():
             mem_path = f"{memory_dir}/tb_epoch{epoch}.json"
             memory_store.save(mem_path)
             logger.info(f"Memory saved: {mem_path} ({memory_store.size()} entries)")
+
+        subsets = sorted({r.get("subset") for r in episode_results if r.get("subset")})
+        if not args.skip_official_convert:
+            converted_root.mkdir(parents=True, exist_ok=True)
+            for subset in subsets:
+                converted_path = converted_root / f"{subset}.json"
+                run_official_converter(raw_answer_root / subset, official_method, converted_path)
+                logger.info(f"Official converted answers saved: {converted_path}")
+
+        if args.official_eval:
+            run_official_pass_rate_eval(
+                converted_answer_path=official_root / "model_predictions_converted",
+                save_path=pass_rate_root,
+                candidate_model=official_model_name,
+                test_sets=subsets,
+                evaluate_times=args.evaluate_times,
+            )
+            logger.info(f"Official SoPR results saved under: {pass_rate_root}")
 
         env.close()
 
