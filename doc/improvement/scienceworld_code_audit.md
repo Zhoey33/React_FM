@@ -46,7 +46,7 @@
 
 - 正式协议不能使用默认 `DEFAULT_EVAL_TASKS`、`max_variations=5`；必须显式传 12 task、`--max-variations 10`、`--step-limit 100`。
 - 旧结果没有 `variation_idx`，只能按 task count 和日志间接复现。
-- `memory_format=success_trajectory/reflexion_reflection` 分支引用未定义 `env_history`，这是 ablation-only 潜在 bug，不影响默认 ReAct / React-FM 主线。
+- ScienceWorld runner 已收敛为 `failure_recovery` memory 主链路；其它 benchmark 的 memory-format ablation 不进入 ScienceWorld 正式协议。
 
 判断: ReAct ScienceWorld baseline 机制基本可信，但旧结果缺少正式复现字段；正式主表仍建议补日志后重跑。
 

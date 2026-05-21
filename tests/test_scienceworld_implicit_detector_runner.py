@@ -123,13 +123,19 @@ def test_judge_detected_failure_triggers_retrieval_and_enters_extraction(monkeyp
         captured["detected_failures"] = detected_failures
         return [
             {
+                "failure_step": 0,
                 "failure_action": "look around",
                 "failure_observation": "You see the same room.",
+                "failure_type": "implicit_no_progress",
+                "detector_source": "judge",
+                "score_before_action": 0.0,
+                "score_after_action": 0.0,
+                "score_delta": 0.0,
                 "solution_action": "inventory",
                 "repair_strategy": "Check inventory before repeating exploration.",
                 "repair_tactic": "Inspect carried items, then choose a task-relevant action.",
                 "repair_action": "inventory",
-                "question_text": "What new information do you need before repeating look around?",
+                "confidence_score": 0.9,
             }
         ]
 
@@ -172,6 +178,17 @@ def test_judge_detected_failure_triggers_retrieval_and_enters_extraction(monkeyp
             "action": "look around",
             "observation": "You see the same room.",
             "failure_type": "implicit_no_progress",
+            "detector_source": "judge",
+            "score_before_action": 0.0,
+            "score_after_action": 0.0,
+            "score_delta": 0.0,
         }
     ]
     assert memory.add_calls[0]["failure_action"] == "look around"
+    assert memory.add_calls[0]["failure_step"] == 0
+    assert memory.add_calls[0]["failure_type"] == "implicit_no_progress"
+    assert memory.add_calls[0]["detector_source"] == "judge"
+    assert memory.add_calls[0]["source_episode_success"] is False
+    assert memory.add_calls[0]["source_episode_score"] == 0.0
+    assert memory.add_calls[0]["confidence_score"] == 0.9
+    assert "question_text" not in memory.add_calls[0]

@@ -65,9 +65,17 @@ ScienceWorld memory 的主作用域固定为 `task_type`:
 - `failure_action`
 - `failure_observation`
 - `failure_type`
+- `failure_step`
+- `detector_source`
+- `score_before_action`
+- `score_after_action`
+- `score_delta`
+- `source_episode_success`
+- `source_episode_score`
 - `repair_strategy`
 - `repair_tactic`
 - `repair_action`
+- `confidence_score`
 
 `question_text` 视为旧字段，后续不作为 ScienceWorld 主协议字段。
 

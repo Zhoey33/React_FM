@@ -42,21 +42,22 @@
 当前实现:
 
 - episode 后基于 `steps[]` 中 detector 触发的失败构造 `detected_failures`。
-- extractor prompt 要求 LLM 只从这些失败步骤中抽取后续真实发生过的修复动作。
+- extractor prompt 要求 LLM 只从这些失败步骤中抽取后续真实发生过的修复动作，并输出 `confidence_score`。
 - `_validate_recovery()` 会验证 `solution_action` 和 `repair_action` 必须出现在 failure 之后。
-- 存储字段包含 `failure_action / failure_observation / solution_action / repair_strategy / repair_tactic / repair_action / question_text`。
+- 存储字段包含 `failure_step / failure_type / detector_source / score_before_action / score_after_action / score_delta / source_episode_success / source_episode_score / confidence_score`，以及 `failure_action / failure_observation / solution_action / repair_strategy / repair_tactic / repair_action`。
+- ScienceWorld 只保留 `failure_recovery` memory format；`success_trajectory / reflexion_reflection` 不再作为 ScienceWorld runner 分支。
 
 主要风险:
 
 - extractor 依赖 detector: detector 漏掉的失败永远不会进入 memory。
 - judge 检出的隐性错误会进入 retrieval 和 memory extraction；旧的 `unproductive` 类型仍会被过滤。
-- `success_trajectory` 和 `reflexion_reflection` ablation 分支引用了未定义变量 `env_history`，非默认 `failure_recovery` 格式会崩溃。
+- `confidence_score` 是 extractor 自评，只能作为分析字段，不能直接当作真实质量标签。
 
 建议:
 
-- 默认主实验继续使用 `failure_recovery`，不要在正式实验里启用两个 ablation memory format，除非先修 `env_history`。
-- 增加 extractor 单元测试: 只抽 detected failure、拒绝 failure 前动作、拒绝不存在于后续轨迹的 repair。
-- 如果要评估 implicit failure，先决定 `unproductive` 是否进入 memory extraction。
+- 默认主实验继续使用 `failure_recovery`。
+- 用 memory quality 标注检查 `confidence_score` 和人工质量标签是否一致。
+- 如果要评估 implicit failure，单独按 `detector_source=judge` 和 `failure_type` 分组看 memory 质量。
 
 ## 3. 记忆检索
 
@@ -117,7 +118,7 @@
 建议在正式重跑前完成:
 
 1. 明确 detector 口径: 默认 rule + LLM judge；如需 rule-only 对照，使用关闭开关单独跑。
-2. 修复非默认 memory format 的 `env_history` bug，或禁止正式命令使用这两个格式。
+2. 保持 ScienceWorld memory format 为 `failure_recovery`，不混入其它 benchmark 的 memory ablation 分支。
 3. 增加 prompt snapshot tests，避免后续改 prompt 时结果不可比。
 4. 用已实现的三类质量脚本做 pilot:
    - detector quality
@@ -138,6 +139,4 @@
 暂不建议直接进正式主表:
 
 - `--inject-mode episode` 且希望在线继续学习。
-- `--memory-format success_trajectory`
-- `--memory-format reflexion_reflection`
 - 未经过 detector quality 标注就声称 LLM judge detector 可靠。

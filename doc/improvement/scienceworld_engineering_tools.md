@@ -278,7 +278,7 @@ python analysis/scienceworld_detector_quality.py summarize \
 用途:
 
 - 评估 memory extractor 生成的 memory entry 是否准确、可用、可执行。
-- 输入是 memory store JSON，不改 runner，也不改 memory store schema。
+- 输入是 memory store JSON；当前 ScienceWorld memory 已包含 provenance 和 `confidence_score`。
 - v1 只做人工标注模板和统计，不调用 LLM 自动判定。
 
 ### 6.1 生成标注模板
@@ -323,15 +323,21 @@ python analysis/scienceworld_memory_quality.py make-template \
   "task_type": "melt",
   "env_idx": 7,
   "created_at": "2026-04-01T00:00:00",
+  "failure_step": 18,
+  "failure_type": "precondition_blocked",
+  "detector_source": "rule",
   "failure_action": "go to kitchen",
   "failure_observation": "The door is not open.",
+  "score_before_action": 0.0,
+  "score_after_action": 0.0,
+  "score_delta": 0.0,
+  "source_episode_success": true,
+  "source_episode_score": 100.0,
   "solution_action": "open door to kitchen -> go to kitchen",
   "repair_strategy": "Open blocked doors before moving.",
   "repair_tactic": "Open the specific door, then retry movement.",
   "repair_action": "open door to kitchen -> go to kitchen",
-  "question_text": "What precondition is missing?",
-  "source_episode_success": true,
-  "source_episode_score": 100.0
+  "confidence_score": 0.92
 }
 ```
 
@@ -370,6 +376,8 @@ python analysis/scienceworld_memory_quality.py summarize \
 
 - `overall`
 - `by_task_type`
+- `by_failure_type`
+- `by_detector_source`
 - `by_quality_label`
 - `by_source_episode_success`
 
@@ -399,6 +407,24 @@ python analysis/scienceworld_memory_quality.py summarize \
 - `invalid_rate` 越高，说明 extractor 生成了更多不可用 memory。
 - `duplicate_rate` 反映冗余记忆比例。
 - `overly_state_bound_rate` 越高，说明 memory 更像轨迹片段，泛化性可能较差。
+
+### 6.3 当前 Memory 生成链路
+
+ScienceWorld 现在只保留 `failure_recovery` 主链路:
+
+1. episode 结束后，从 `steps[]` 取 detector 标出的失败。
+2. extractor prompt 输入失败步骤、失败类型、detector source、分数变化和后续轨迹。
+3. extractor 输出 `solution_action / repair_strategy / repair_tactic / repair_action / confidence_score`。
+4. runner 用真实日志覆盖 `failure_action / failure_observation / failure_type`，避免 LLM 改写失败事实。
+5. `solution_action / repair_action` 必须出现在 failure 之后的真实轨迹中，否则丢弃该 memory。
+
+字段用途:
+
+- 检索: `task_type + failure_action + failure_observation`。
+- prompt 注入: `repair_strategy / repair_tactic / repair_action`。
+- 质量评估: provenance 字段、repair 字段、episode 成功/分数、`confidence_score`。
+
+`question_text` 是旧兼容字段，新 ScienceWorld memory 不再生成或依赖它。
 
 ## 7. Post-Injection Correction 标注与统计
 

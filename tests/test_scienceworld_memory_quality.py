@@ -24,10 +24,18 @@ def _write_memory_store(path):
                     "task_type": "melt",
                     "env_idx": 7,
                     "created_at": "2026-04-01T00:00:00",
-                    "question_text": "What precondition is missing?",
+                    "failure_step": 4,
+                    "failure_type": "precondition_blocked",
+                    "detector_source": "rule",
+                    "score_before_action": 0.0,
+                    "score_after_action": 0.0,
+                    "score_delta": 0.0,
+                    "source_episode_success": True,
+                    "source_episode_score": 100.0,
                     "repair_strategy": "Open blocked doors before moving.",
                     "repair_tactic": "Open the specific door, then retry movement.",
                     "repair_action": "open door to kitchen -> go to kitchen",
+                    "confidence_score": 0.91,
                     "embedding": [0.1, 0.2],
                 },
                 {
@@ -100,15 +108,21 @@ def test_make_memory_quality_template_reads_buckets_and_enriches_episode_fields(
         "task_type",
         "env_idx",
         "created_at",
+        "failure_step",
+        "failure_type",
+        "detector_source",
         "failure_action",
         "failure_observation",
+        "score_before_action",
+        "score_after_action",
+        "score_delta",
+        "source_episode_success",
+        "source_episode_score",
         "solution_action",
         "repair_strategy",
         "repair_tactic",
         "repair_action",
-        "question_text",
-        "source_episode_success",
-        "source_episode_score",
+        "confidence_score",
         "quality_label",
         "failure_action_accurate",
         "failure_observation_has_evidence",
@@ -121,8 +135,13 @@ def test_make_memory_quality_template_reads_buckets_and_enriches_episode_fields(
     assert row["source_file"] == str(memory_path)
     assert row["bucket"] == "melt"
     assert row["scope"] == "task_type"
+    assert row["failure_step"] == 4
+    assert row["failure_type"] == "precondition_blocked"
+    assert row["detector_source"] == "rule"
     assert row["source_episode_success"] is True
     assert row["source_episode_score"] == 100.0
+    assert row["confidence_score"] == 0.91
+    assert "question_text" not in row
     assert row["quality_label"] == ""
     assert row["failure_action_accurate"] is None
     assert row["annotation_notes"] == ""

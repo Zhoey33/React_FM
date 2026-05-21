@@ -47,8 +47,8 @@ def parse_args():
     parser.add_argument("--run-name", type=str, default=None, help="Custom run name")
     parser.add_argument("--inject-mode", choices=["in_loop", "episode", "none"], default="in_loop")
     parser.add_argument("--memory-style", choices=["original", "factual", "reflexion", "hint"], default="original")
-    parser.add_argument("--memory-format", choices=["failure_recovery", "success_trajectory", "reflexion_reflection"],
-                        default="failure_recovery", help="Memory storage format for ablation")
+    parser.add_argument("--memory-format", choices=["failure_recovery"],
+                        default="failure_recovery", help="ScienceWorld memory storage format")
     parser.add_argument("--retrieval-mode", choices=["hybrid", "bm25_only", "embedding_only", "random"],
                         default="hybrid", help="Retrieval method for ablation")
     parser.add_argument("--enable-implicit-failures", action=argparse.BooleanOptionalAction,
@@ -168,6 +168,16 @@ def _is_task_complete(done: bool, info: dict) -> tuple[bool, bool]:
     """Check episode termination using ScienceWorld's score convention."""
     score = info.get("score", 0.0)
     return done, score >= 100.0
+
+
+def _score_delta(before, after) -> float | None:
+    """Compute a compact score delta for memory provenance."""
+    if before is None or after is None:
+        return None
+    try:
+        return round(float(after) - float(before), 4)
+    except (TypeError, ValueError):
+        return None
 
 
 def _infer_task_name_from_env(env) -> str:
@@ -416,34 +426,42 @@ class ScienceWorldReActAgent:
                     "action": step["action"],
                     "observation": step["observation"],
                     "failure_type": step.get("failure_type", ""),
+                    "detector_source": step.get("detector_source", ""),
+                    "score_before_action": step.get("score_before_action"),
+                    "score_after_action": step.get("score_after_action"),
+                    "score_delta": _score_delta(
+                        step.get("score_before_action"),
+                        step.get("score_after_action"),
+                    ),
                 }
                 for step in steps
                 if step.get("failure_detected")
                 and not step.get("is_think")
                 and step.get("failure_type") != "unproductive"
             ]
-            if self.memory_format == "success_trajectory":
-                from src.memory_extractor_ablation import extract_success_trajectories
-                recoveries = extract_success_trajectories(self.extractor_llm, env_history, success)
-            elif self.memory_format == "reflexion_reflection":
-                from src.memory_extractor_ablation import extract_reflexion_reflections
-                recoveries = extract_reflexion_reflections(self.extractor_llm, env_history)
-            else:
-                recoveries = extract_failure_recoveries(
-                    self.extractor_llm,
-                    env_history_records,
-                    detected_failures=detected_failures,
-                )
+            recoveries = extract_failure_recoveries(
+                self.extractor_llm,
+                env_history_records,
+                detected_failures=detected_failures,
+            )
             for rec in recoveries:
                 self.memory.add(
                     failure_action=rec["failure_action"],
                     failure_observation=rec["failure_observation"],
                     solution_action=rec["solution_action"],
                     task_type=task_type, env_idx=env_idx,
-                    question_text=rec.get("question_text", ""),
                     repair_strategy=rec.get("repair_strategy", ""),
                     repair_tactic=rec.get("repair_tactic", ""),
                     repair_action=rec.get("repair_action", ""),
+                    failure_step=rec.get("failure_step"),
+                    failure_type=rec.get("failure_type", ""),
+                    detector_source=rec.get("detector_source", ""),
+                    score_before_action=rec.get("score_before_action"),
+                    score_after_action=rec.get("score_after_action"),
+                    score_delta=rec.get("score_delta"),
+                    source_episode_success=success,
+                    source_episode_score=final_score,
+                    confidence_score=rec.get("confidence_score"),
                 )
                 memories_stored += 1
 

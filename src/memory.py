@@ -53,6 +53,16 @@ class FailureMemoryEntry:
     repair_strategy: str = ""  # L1: high-level goal/direction guidance
     repair_tactic: str = ""    # L2: multi-step plan for next actions
     repair_action: str = ""    # L3: exact corrective command(s)
+    # ScienceWorld provenance fields for memory-quality analysis.
+    failure_step: int | None = None
+    failure_type: str = ""
+    detector_source: str = ""
+    score_before_action: float | None = None
+    score_after_action: float | None = None
+    score_delta: float | None = None
+    source_episode_success: bool | None = None
+    source_episode_score: float | None = None
+    confidence_score: float | None = None
 
     def to_prompt_str(self) -> str:
         return (
@@ -99,6 +109,24 @@ class FailureMemoryEntry:
             d["repair_tactic"] = self.repair_tactic
         if self.repair_action:
             d["repair_action"] = self.repair_action
+        if self.failure_step is not None:
+            d["failure_step"] = self.failure_step
+        if self.failure_type:
+            d["failure_type"] = self.failure_type
+        if self.detector_source:
+            d["detector_source"] = self.detector_source
+        if self.score_before_action is not None:
+            d["score_before_action"] = self.score_before_action
+        if self.score_after_action is not None:
+            d["score_after_action"] = self.score_after_action
+        if self.score_delta is not None:
+            d["score_delta"] = self.score_delta
+        if self.source_episode_success is not None:
+            d["source_episode_success"] = self.source_episode_success
+        if self.source_episode_score is not None:
+            d["source_episode_score"] = self.source_episode_score
+        if self.confidence_score is not None:
+            d["confidence_score"] = self.confidence_score
         return d
 
 
@@ -198,6 +226,15 @@ class FailureMemoryStore:
         repair_strategy: str = "",
         repair_tactic: str = "",
         repair_action: str = "",
+        failure_step: int | None = None,
+        failure_type: str = "",
+        detector_source: str = "",
+        score_before_action: float | None = None,
+        score_after_action: float | None = None,
+        score_delta: float | None = None,
+        source_episode_success: bool | None = None,
+        source_episode_score: float | None = None,
+        confidence_score: float | None = None,
     ) -> FailureMemoryEntry:
         query_text = self._build_query_text(failure_action, failure_observation)
         embedding = self._embed(query_text)
@@ -215,6 +252,15 @@ class FailureMemoryStore:
             repair_strategy=repair_strategy,
             repair_tactic=repair_tactic,
             repair_action=repair_action,
+            failure_step=failure_step,
+            failure_type=failure_type,
+            detector_source=detector_source,
+            score_before_action=score_before_action,
+            score_after_action=score_after_action,
+            score_delta=score_delta,
+            source_episode_success=source_episode_success,
+            source_episode_score=source_episode_score,
+            confidence_score=confidence_score,
         )
 
         bucket_key = self._bucket_key(task_type=task_type, env_idx=env_idx)
@@ -451,6 +497,15 @@ class FailureMemoryStore:
                     repair_strategy=d.get("repair_strategy", ""),
                     repair_tactic=d.get("repair_tactic", ""),
                     repair_action=d.get("repair_action", ""),
+                    failure_step=d.get("failure_step"),
+                    failure_type=d.get("failure_type", ""),
+                    detector_source=d.get("detector_source", ""),
+                    score_before_action=d.get("score_before_action"),
+                    score_after_action=d.get("score_after_action"),
+                    score_delta=d.get("score_delta"),
+                    source_episode_success=d.get("source_episode_success"),
+                    source_episode_score=d.get("source_episode_score"),
+                    confidence_score=d.get("confidence_score"),
                 )
                 self._env_entries[bucket_key].append(entry)
 

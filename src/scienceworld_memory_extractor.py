@@ -1,8 +1,4 @@
-"""Extract failure-recovery pairs from ScienceWorld trajectories using LLM.
-
-V2: Directly extracts tiered repair fields (strategy/tactic/action/question)
-in a single LLM call, eliminating the separate canonicalize step.
-"""
+"""Extract provenance-rich failure-recovery memories from ScienceWorld trajectories."""
 
 import json
 import logging
@@ -25,15 +21,16 @@ A failure-recovery pattern is when:
    - by satisfying a missing precondition and retrying the blocked action
 4. The trajectory provides enough evidence to state HOW the failure was actually resolved
 
-For each pattern found, output EIGHT fields:
+For each pattern found, output NINE fields:
 - "failure_step": the numbered trajectory step where the failed action happened
 - "failure_action": the action that failed
 - "failure_observation": a SHORT single-line summary of the environment response
+- "failure_type": the detector failure type for that failed step
 - "solution_action": the corrective steps that fixed the problem, joined with " → "
 - "repair_strategy": a 1-sentence high-level guidance about WHAT the agent should do and WHERE to go
 - "repair_tactic": a 1-2 sentence specific plan for the next few steps
 - "repair_action": the exact corrective action(s) using valid environment commands
-- "question_text": a diagnostic question that hints at the problem WITHOUT revealing the answer
+- "confidence_score": a number from 0.0 to 1.0 for how strongly the trajectory supports this reusable memory
 
 Formatting requirements:
 - Output valid JSON only
@@ -41,6 +38,7 @@ Formatting requirements:
 - "solution_action" and "repair_action" must be copied exactly from actions that appear later in the trajectory
 - Every action listed in "solution_action" must occur strictly AFTER "failure_step"
 - Do NOT use actions from before the failure
+- "confidence_score" should be high only when the later trajectory clearly supports the repair
 - Extract the method that solves the failure, not just the next token or local interaction after the failure
 - The memory should still make sense as advice for another variation of the same task type
 - Prefer stable environment commands or short command sequences over transient UI/menu responses
@@ -71,7 +69,7 @@ You pour the glass cup into the metal pot. The metal pot now contains: water.
 </example_trajectory>
 
 <example_output>
-[{"failure_step": "0", "failure_action": "pick up metal pot from stove", "failure_observation": "No known action matches that input.", "solution_action": "pick up metal pot", "repair_strategy": "Use simplified action syntax — do not specify the location when picking up objects.", "repair_tactic": "Try 'pick up <object>' without specifying 'from <location>'. The environment will pick up the object from its current location.", "repair_action": "pick up metal pot", "question_text": "Does the environment support specifying the source location in pick up commands?"}, {"failure_step": "2", "failure_action": "pour water into metal pot", "failure_observation": "No known action matches that input.", "solution_action": "pour glass cup into metal pot", "repair_strategy": "Pour the container holding the liquid, not the liquid itself — the environment operates on containers.", "repair_tactic": "Identify which container holds the water and use 'pour <container> into <target>' instead of naming the liquid directly.", "repair_action": "pour glass cup into metal pot", "question_text": "Are you trying to pour the liquid directly, or the container that holds it?"}]
+[{"failure_step": "0", "failure_action": "pick up metal pot from stove", "failure_observation": "No known action matches that input.", "failure_type": "syntax_or_parse", "solution_action": "pick up metal pot", "repair_strategy": "Use simplified action syntax — do not specify the location when picking up objects.", "repair_tactic": "Try 'pick up <object>' without specifying 'from <location>'. The environment will pick up the object from its current location.", "repair_action": "pick up metal pot", "confidence_score": 0.95}, {"failure_step": "2", "failure_action": "pour water into metal pot", "failure_observation": "No known action matches that input.", "failure_type": "syntax_or_parse", "solution_action": "pour glass cup into metal pot", "repair_strategy": "Pour the container holding the liquid, not the liquid itself — the environment operates on containers.", "repair_tactic": "Identify which container holds the water and use 'pour <container> into <target>' instead of naming the liquid directly.", "repair_action": "pour glass cup into metal pot", "confidence_score": 0.92}]
 </example_output>
 
 <example_trajectory>
@@ -84,7 +82,7 @@ You move to the kitchen.
 </example_trajectory>
 
 <example_output>
-[{"failure_step": "0", "failure_action": "go to kitchen", "failure_observation": "The door is not open.", "solution_action": "open door to kitchen → go to kitchen", "repair_strategy": "Satisfy the missing precondition before retrying movement actions.", "repair_tactic": "If movement is blocked because a door is closed, open that specific door first and then retry going to the destination room.", "repair_action": "open door to kitchen → go to kitchen", "question_text": "What precondition must be satisfied before going to the kitchen?"}]
+[{"failure_step": "0", "failure_action": "go to kitchen", "failure_observation": "The door is not open.", "failure_type": "precondition_blocked", "solution_action": "open door to kitchen → go to kitchen", "repair_strategy": "Satisfy the missing precondition before retrying movement actions.", "repair_tactic": "If movement is blocked because a door is closed, open that specific door first and then retry going to the destination room.", "repair_action": "open door to kitchen → go to kitchen", "confidence_score": 0.96}]
 </example_output>
 
 <example_trajectory>
@@ -132,6 +130,28 @@ def _extract_json_array_text(response: str) -> str:
 
 def _normalize_action_text(text: str) -> str:
     return " ".join(str(text).split()).strip().lower()
+
+
+def _as_float(value, default: float | None = None) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _score_delta(before, after) -> float | None:
+    before_float = _as_float(before)
+    after_float = _as_float(after)
+    if before_float is None or after_float is None:
+        return None
+    return round(after_float - before_float, 4)
+
+
+def _confidence_score(value) -> float:
+    score = _as_float(value, 0.0)
+    if score is None:
+        return 0.0
+    return max(0.0, min(1.0, score))
 
 
 def _normalize_trajectory_steps(trajectory: list[tuple[str, str]] | list[dict]) -> list[dict]:
@@ -186,6 +206,13 @@ def _normalize_detected_failures(
             action = str(item.get("action", ""))
             observation = str(item.get("observation", ""))
             failure_type = str(item.get("failure_type", ""))
+            detector_source = str(item.get("detector_source", ""))
+            score_before_action = item.get("score_before_action")
+            score_after_action = item.get("score_after_action")
+            score_delta = item.get(
+                "score_delta",
+                _score_delta(score_before_action, score_after_action),
+            )
             step_num = item.get("step")
             trajectory_index = None
             if step_num is not None:
@@ -200,6 +227,10 @@ def _normalize_detected_failures(
         else:
             action, observation = item
             failure_type = ""
+            detector_source = ""
+            score_before_action = None
+            score_after_action = None
+            score_delta = None
             trajectory_index = _find_matching_step(
                 trajectory_steps, action, observation, start_idx=search_start
             )
@@ -219,6 +250,10 @@ def _normalize_detected_failures(
                 "action": step["action"],
                 "observation": step["observation"],
                 "failure_type": failure_type,
+                "detector_source": detector_source,
+                "score_before_action": score_before_action,
+                "score_after_action": score_after_action,
+                "score_delta": score_delta,
             }
         )
         search_start = trajectory_index + 1
@@ -261,8 +296,7 @@ def _validate_recovery(
     trajectory_steps: list[dict],
 ) -> dict | None:
     failure_step_raw = str(item.get("failure_step", "")).strip().strip("[]")
-    failure_action = str(item.get("failure_action", "")).strip()
-    if not failure_step_raw or not failure_action:
+    if not failure_step_raw:
         return None
 
     try:
@@ -273,8 +307,6 @@ def _validate_recovery(
     failure_match = None
     for failure in explicit_failures:
         if failure["step"] != failure_step:
-            continue
-        if _normalize_action_text(failure["action"]) != _normalize_action_text(failure_action):
             continue
         failure_match = failure
         break
@@ -293,8 +325,22 @@ def _validate_recovery(
     ):
         item["repair_action"] = item["solution_action"]
 
-    item["failure_step"] = str(failure_step)
+    item["failure_step"] = failure_step
     item["failure_action"] = failure_match["action"]
+    item["failure_observation"] = _normalize_text(failure_match["observation"], max_chars=500)
+    item["failure_type"] = failure_match.get("failure_type", "")
+    item["detector_source"] = failure_match.get("detector_source", "")
+    item["score_before_action"] = failure_match.get("score_before_action")
+    item["score_after_action"] = failure_match.get("score_after_action")
+    item["score_delta"] = failure_match.get(
+        "score_delta",
+        _score_delta(
+            failure_match.get("score_before_action"),
+            failure_match.get("score_after_action"),
+        ),
+    )
+    item["confidence_score"] = _confidence_score(item.get("confidence_score"))
+    item.pop("question_text", None)
     return item
 
 
@@ -317,6 +363,7 @@ def build_extractor_prompt(
             "The following interactions were explicitly detected as failures during the run.",
             "Only extract patterns for these failed steps.",
             "For each output item, failure_step must match one of the failed steps below.",
+            "Return confidence_score from 0.0 to 1.0 for each memory.",
             "solution_action and repair_action must be exact later actions from the trajectory, after the failed step.",
             "A valid repair may be a precondition fix followed by retrying the blocked action.",
             "If no later action actually repairs a failed step, omit it.",
@@ -325,9 +372,17 @@ def build_extractor_prompt(
         ]
         for failure in explicit_failures:
             extra = f' | type: "{failure["failure_type"]}"' if failure["failure_type"] else ""
+            source = (
+                f' | source: "{failure["detector_source"]}"'
+                if failure.get("detector_source")
+                else ""
+            )
+            score_delta = failure.get("score_delta")
+            score_info = f' | score_delta: "{score_delta}"' if score_delta is not None else ""
             lines.append(
                 f'- failed step: "{failure["step"]}" | action: "{failure["action"]}"'
-                f' | observation: "{_normalize_text(failure["observation"], max_chars=180)}"{extra}'
+                f' | observation: "{_normalize_text(failure["observation"], max_chars=180)}"'
+                f'{extra}{source}{score_info}'
             )
         failure_block = "\n\n" + "\n".join(lines)
 
@@ -344,8 +399,8 @@ Output ONLY the JSON array."""
 
 
 # Fields required from extractor output
-_REQUIRED_FIELDS = ("failure_action", "failure_observation", "solution_action")
-_TIERED_FIELDS = ("repair_strategy", "repair_tactic", "repair_action", "question_text")
+_REQUIRED_FIELDS = ("failure_step", "solution_action")
+_TIERED_FIELDS = ("repair_strategy", "repair_tactic", "repair_action", "confidence_score")
 
 
 def extract_failure_recoveries(
@@ -355,9 +410,9 @@ def extract_failure_recoveries(
 ) -> list[dict]:
     """Extract failure-recovery pairs from a ScienceWorld episode trajectory.
 
-    Returns list of dicts with 7 fields:
+    Returns list of dicts with provenance and repair fields:
         failure_action, failure_observation, solution_action,
-        repair_strategy, repair_tactic, repair_action, question_text
+        repair_strategy, repair_tactic, repair_action, confidence_score
     """
     trajectory_steps = _normalize_trajectory_steps(trajectory)
     if not trajectory_steps:
@@ -412,12 +467,14 @@ def extract_failure_recoveries(
                 # Ensure tiered fields exist with fallbacks
                 for tf in _TIERED_FIELDS:
                     if tf not in item or not item[tf]:
-                        if tf == "question_text":
-                            item[tf] = f"What went wrong when you tried '{item['failure_action']}'?"
-                        elif tf == "repair_action":
+                        if tf == "repair_action":
                             item[tf] = item["solution_action"]
+                        elif tf == "confidence_score":
+                            item[tf] = 0.0
                         else:
                             item[tf] = ""
+                item["confidence_score"] = _confidence_score(item.get("confidence_score"))
+                item.pop("question_text", None)
                 valid.append(item)
 
         logger.info(f"Extractor found {len(valid)} failure-recovery patterns (tiered)")
