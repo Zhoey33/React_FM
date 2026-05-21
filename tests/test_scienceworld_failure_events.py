@@ -23,8 +23,8 @@ def test_build_failure_events_records_recovery_window():
                 "score_after_action": 10.0,
             },
             {"step": 2, "action": "go to kitchen", "score_after_action": 10.0},
-            {"step": 3, "action": "pick up metal pot", "score_after_action": 10.0},
-            {"step": 4, "action": "activate stove", "score_after_action": 18.0},
+            {"step": 3, "action": "pick up metal pot", "score_after_action": 18.0},
+            {"step": 4, "action": "activate stove", "score_after_action": 16.0},
         ],
     }
 
@@ -48,7 +48,8 @@ def test_build_failure_events_records_recovery_window():
             "next_action": "go to kitchen",
             "score_before_failure": 10.0,
             "score_after_1_step": 10.0,
-            "score_after_3_steps": 18.0,
+            "score_after_2_steps": 18.0,
+            "score_after_3_steps": 16.0,
             "recovered_within_1_step": False,
             "recovered_within_3_steps": True,
         }

@@ -14,6 +14,20 @@ def _score_at(steps: list[dict[str, Any]], failure_index: int, offset: int) -> f
     return steps[target_index].get("score_after_action")
 
 
+def _recovered_within(
+    steps: list[dict[str, Any]],
+    failure_index: int,
+    *,
+    score_before: float,
+    window: int,
+) -> bool:
+    for offset in range(1, window + 1):
+        score_after = _score_at(steps, failure_index, offset)
+        if score_after is not None and score_after > score_before:
+            return True
+    return False
+
+
 def build_failure_events(episode: dict[str, Any], *, memory_mode: str) -> list[dict[str, Any]]:
     """Convert one episode result into failure-event rows."""
     steps = episode.get("steps", [])
@@ -26,6 +40,7 @@ def build_failure_events(episode: dict[str, Any], *, memory_mode: str) -> list[d
 
         score_before = step.get("score_before_action", step.get("score_after_action", 0.0))
         score_after_1 = _score_at(steps, index, 1)
+        score_after_2 = _score_at(steps, index, 2)
         score_after_3 = _score_at(steps, index, 3)
         retrieval_hit = bool(step.get("memory_retrieved", 0))
 
@@ -47,12 +62,13 @@ def build_failure_events(episode: dict[str, Any], *, memory_mode: str) -> list[d
                 "next_action": steps[index + 1].get("action", "") if index + 1 < len(steps) else "",
                 "score_before_failure": score_before,
                 "score_after_1_step": score_after_1,
+                "score_after_2_steps": score_after_2,
                 "score_after_3_steps": score_after_3,
-                "recovered_within_1_step": (
-                    score_after_1 is not None and score_after_1 > score_before
+                "recovered_within_1_step": _recovered_within(
+                    steps, index, score_before=score_before, window=1
                 ),
-                "recovered_within_3_steps": (
-                    score_after_3 is not None and score_after_3 > score_before
+                "recovered_within_3_steps": _recovered_within(
+                    steps, index, score_before=score_before, window=3
                 ),
             }
         )
