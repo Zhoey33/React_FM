@@ -26,6 +26,9 @@ from src.llm import LLMClient
 from src.memory import FailureMemoryStore
 from src.scienceworld_failure_detector import ScienceWorldFailureDetector
 from src.scienceworld_env import ScienceWorldEnv, DEFAULT_EVAL_TASKS
+from src.scienceworld_failure_events import write_failure_events_jsonl
+from src.scienceworld_reporting import build_protocol_metadata
+from src.scienceworld_reporting import compute_summary as compute_scienceworld_summary
 from src.log_utils import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -68,47 +71,18 @@ def save_results(results: list[dict], summary: dict, filepath: str):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def compute_summary(results: list[dict], memory_stats: dict, mode: str) -> dict:
-    total = len(results)
-    successes = sum(1 for r in results if r["success"])
-
-    by_type: dict[str, dict] = {}
-    for r in results:
-        tt = r["task_type"]
-        if tt not in by_type:
-            by_type[tt] = {"total": 0, "success": 0}
-        by_type[tt]["total"] += 1
-        if r["success"]:
-            by_type[tt]["success"] += 1
-
-    for v in by_type.values():
-        v["rate"] = round(v["success"] / v["total"], 4) if v["total"] > 0 else 0
-
-    # ScienceWorld API reports score as round(100 * getScore()).
-    # Full success is 100, but the environment can also return negative scores.
-    scores = [r.get("score", 0.0) / 100.0 for r in results]
-    avg_score = sum(scores) / len(scores) if scores else 0.0
-
-    total_tokens = sum(r["total_tokens"] for r in results)
-    agent_tokens = sum(r.get("agent_tokens", r["total_tokens"]) for r in results)
-    judge_tokens = sum(r.get("judge_tokens", 0) for r in results)
-    extractor_tokens = sum(r.get("extractor_tokens", 0) for r in results)
-
-    return {
-        "mode": mode,
-        "benchmark": "scienceworld",
-        "total_envs": total,
-        "total_success": successes,
-        "success_rate": round(successes / total, 4) if total > 0 else 0,
-        "avg_score": round(avg_score, 4),
-        "by_task_type": by_type,
-        "total_tokens": total_tokens,
-        "agent_tokens": agent_tokens,
-        "judge_tokens": judge_tokens,
-        "extractor_tokens": extractor_tokens,
-        "avg_tokens_per_episode": round(total_tokens / total) if total > 0 else 0,
-        "memory_stats": memory_stats,
-    }
+def compute_summary(
+    results: list[dict],
+    memory_stats: dict,
+    mode: str,
+    protocol: dict | None = None,
+) -> dict:
+    return compute_scienceworld_summary(
+        results,
+        mode=mode,
+        memory_stats=memory_stats,
+        protocol=protocol,
+    )
 
 
 def log_summary(summary: dict):
@@ -118,7 +92,9 @@ def log_summary(summary: dict):
     logger.info("=" * 60)
     logger.info(f"  Total: {summary['total_success']}/{summary['total_envs']} "
                 f"({summary['success_rate']:.1%})")
-    logger.info(f"  Avg Score: {summary['avg_score']:.2%}")
+    logger.info(
+        f"  Avg Score: {summary['avg_score']:.2f}"
+    )
     logger.info("-" * 60)
     logger.info(f"  {'Task Name':<40} {'Success':>8} {'Total':>8} {'Rate':>8}")
     logger.info("-" * 60)
@@ -196,6 +172,28 @@ def _infer_task_name_from_env(env) -> str:
     return "unknown"
 
 
+def _infer_variation_idx_from_env(env) -> int | None:
+    """Best-effort variation recovery for exception and skip accounting."""
+    schedule = getattr(env, "_schedule", None)
+    schedule_idx = getattr(env, "_schedule_idx", 0)
+    if not schedule:
+        return None
+    if schedule_idx > 0 and schedule_idx - 1 < len(schedule):
+        return schedule[schedule_idx - 1][1]
+    if schedule_idx < len(schedule):
+        return schedule[schedule_idx][1]
+    return None
+
+
+def _format_retrieved_memory_text(entries: list) -> str:
+    """Compact retrieved memories for failure-event logs."""
+    lines = []
+    for entry in entries:
+        repair = entry.get_repair_display() if hasattr(entry, "get_repair_display") else ""
+        lines.append(f"{entry.memory_id}: {repair}")
+    return "\n".join(lines)
+
+
 class ScienceWorldReActAgent:
     """ReAct agent adapted for ScienceWorld."""
 
@@ -243,6 +241,7 @@ class ScienceWorldReActAgent:
             self.extractor_llm.tracker.reset()
 
         init_obs, task_type, info = env.reset()
+        variation_idx = info.get("variation_idx")
 
         history: list[tuple[str, str]] = []
         action_history: list[str] = []
@@ -324,6 +323,7 @@ class ScienceWorldReActAgent:
             else:
                 consecutive_thinks = 0
 
+            score_before_action = final_score
             observation, reward, done, step_info = env.step(action)
             logger.info(f"    obs: {observation[:80]}")
             action_history.append(action)
@@ -338,6 +338,11 @@ class ScienceWorldReActAgent:
                 "step": step_num, "action": action, "observation": observation[:200],
                 "is_think": False, "failure_detected": False, "failure_type": "",
                 "memory_retrieved": 0,
+                "retrieval_attempted": False,
+                "retrieved_memory_ids": [],
+                "injected_memory_text": "",
+                "score_before_action": score_before_action,
+                "score_after_action": final_score,
             }
 
             if (
@@ -354,11 +359,16 @@ class ScienceWorldReActAgent:
                     logger.info(f"    FAILURE detected: {det.failure_type}")
 
                     if self.inject_mode == "in_loop":
+                        record["retrieval_attempted"] = True
                         retrieved = self.memory.retrieve(
                             query_action=action, query_observation=observation,
                             task_type=task_type, top_k=self.max_memory_inject, env_idx=env_idx,
                         )
                         record["memory_retrieved"] = len(retrieved)
+                        record["retrieved_memory_ids"] = [
+                            entry.memory_id for entry in retrieved
+                        ]
+                        record["injected_memory_text"] = _format_retrieved_memory_text(retrieved)
                         memories_retrieved_total += len(retrieved)
                         if retrieved:
                             current_retrieved = retrieved
@@ -424,6 +434,7 @@ class ScienceWorldReActAgent:
         result = {
             "env_idx": env_idx,
             "task_type": task_type,
+            "variation_idx": variation_idx,
             "task_description": init_obs[:200],
             "success": success,
             "score": final_score,
@@ -531,8 +542,8 @@ def main():
 
     task_names = args.tasks or DEFAULT_EVAL_TASKS
 
-    # Track per-env success across epochs: env_idx -> (task_type, score)
-    env_success: dict[int, tuple[str, float]] = {}
+    # Track per-env success across epochs: env_idx -> (task_type, variation_idx, score)
+    env_success: dict[int, tuple[str, int | None, float]] = {}
 
     if args.resume_results:
         with open(args.resume_results) as f:
@@ -540,7 +551,11 @@ def main():
         for ep in prev_data.get("episodes", []):
             idx = ep["env_idx"]
             if ep.get("success"):
-                env_success[idx] = (ep.get("task_type", "unknown"), ep.get("score", 100))
+                env_success[idx] = (
+                    ep.get("task_type", "unknown"),
+                    ep.get("variation_idx"),
+                    ep.get("score", 100),
+                )
         logger.info(f"Loaded {len(env_success)} succeeded envs from {args.resume_results}")
 
     for epoch in range(1, num_epochs + 1):
@@ -559,6 +574,15 @@ def main():
 
         episode_results = []
         max_envs = args.max_envs or env.total_episodes
+        protocol = build_protocol_metadata(
+            split=args.split,
+            tasks=task_names,
+            max_variations=args.max_variations,
+            step_limit=args.step_limit,
+            test_time_writable=bool(not is_baseline and args.split == "test" and extractor_llm is not None),
+            memory_scope="task_type" if memory_store else None,
+            max_envs=max_envs,
+        )
         env_count = 0
         num_skipped = 0
 
@@ -567,10 +591,11 @@ def main():
                 # Skip already-succeeded envs in later epochs
                 if epoch > 1 and (env_count + 1) in env_success:
                     env.skip()
-                    prev_task_type, prev_score = env_success[env_count + 1]
+                    prev_task_type, prev_variation_idx, prev_score = env_success[env_count + 1]
                     episode_results.append({
                         "env_idx": env_count + 1,
                         "task_type": prev_task_type,
+                        "variation_idx": prev_variation_idx,
                         "task_description": "",
                         "success": True,
                         "score": prev_score,
@@ -595,7 +620,11 @@ def main():
                 episode_results.append(result)
 
                 if result["success"]:
-                    env_success[env_count + 1] = (result["task_type"], result.get("score", 100))
+                    env_success[env_count + 1] = (
+                        result["task_type"],
+                        result.get("variation_idx"),
+                        result.get("score", 100),
+                    )
 
                 env_count += 1
 
@@ -610,7 +639,7 @@ def main():
                 # Intermediate save every 10 envs
                 if env_count % 10 == 0:
                     mem_stats = memory_store.stats() if memory_store else {}
-                    summary = compute_summary(episode_results, mem_stats, mode)
+                    summary = compute_summary(episode_results, mem_stats, mode, protocol)
                     save_results(
                         episode_results, summary,
                         f"{results_dir}/{run_name}{epoch}_intermediate.json"
@@ -625,6 +654,7 @@ def main():
                 episode_results.append({
                     "env_idx": env_count + 1,
                     "task_type": _infer_task_name_from_env(env),
+                    "variation_idx": _infer_variation_idx_from_env(env),
                     "task_description": "",
                     "success": False,
                     "score": -100.0,
@@ -646,12 +676,20 @@ def main():
             logger.info(f"  Skipped {num_skipped} already-succeeded envs")
 
         mem_stats = memory_store.stats() if memory_store else {}
-        summary = compute_summary(episode_results, mem_stats, mode)
+        summary = compute_summary(episode_results, mem_stats, mode, protocol)
         log_summary(summary)
 
         result_path = f"{results_dir}/{run_name}{epoch}.json"
         save_results(episode_results, summary, result_path)
         logger.info(f"Results saved: {result_path}")
+
+        failure_event_path = f"{results_dir}/{run_name}{epoch}_failure_events.jsonl"
+        failure_event_count = write_failure_events_jsonl(
+            episode_results,
+            failure_event_path,
+            memory_mode="baseline" if is_baseline else args.inject_mode,
+        )
+        logger.info(f"Failure events saved: {failure_event_path} ({failure_event_count} rows)")
 
         if memory_store:
             mem_path = f"{memory_dir}/sw_epoch{epoch}.json"

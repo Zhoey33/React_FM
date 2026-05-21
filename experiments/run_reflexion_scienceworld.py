@@ -29,6 +29,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.llm import LLMClient
 from src.scienceworld_env import ScienceWorldEnv, DEFAULT_EVAL_TASKS
+from src.scienceworld_reporting import build_protocol_metadata
+from src.scienceworld_reporting import compute_summary as compute_scienceworld_summary
 from src.reflexion_agent import generate_reflection
 from src.log_utils import setup_logging
 from prompts.scienceworld_prompts import get_fewshot_examples, SYSTEM_PROMPT_BASE
@@ -104,7 +106,18 @@ def build_reflexion_prompt(task_type, task_obs, history, memory=None):
     return prompt
 
 
-def run_episode(llm, env, env_idx, pass_idx, total_passes, task_type, init_obs, memory, max_steps):
+def run_episode(
+    llm,
+    env,
+    env_idx,
+    pass_idx,
+    total_passes,
+    task_type,
+    variation_idx,
+    init_obs,
+    memory,
+    max_steps,
+):
     """Run one ScienceWorld episode with optional Reflexion memory."""
     t0 = time.time()
     llm.tracker.reset()
@@ -174,11 +187,14 @@ def run_episode(llm, env, env_idx, pass_idx, total_passes, task_type, init_obs, 
         "env_idx": env_idx,
         "pass_idx": pass_idx,
         "task_type": task_type,
+        "variation_idx": variation_idx,
         "task_description": init_obs[:200],
         "success": success,
         "score": final_score,
         "total_steps": len(steps),
         "total_tokens": agent_stats["total_tokens"],
+        "agent_tokens": agent_stats["total_tokens"],
+        "reflection_tokens": 0,
         "wall_time_s": round(wall_time, 2),
         "skipped": False,
         "memory_items_used": len(injected_memory),
@@ -206,35 +222,8 @@ def save_run_report(payload, filepath):
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
-def compute_summary(results, mode):
-    total = len(results)
-    successes = sum(1 for r in results if r["success"])
-    # ScienceWorld may return negative scores; keep the official scale so
-    # Reflexion is directly comparable with the main ScienceWorld runners.
-    scores = [r.get("score", 0.0) / 100.0 for r in results]
-    avg_score = sum(scores) / len(scores) if scores else 0.0
-    by_type = {}
-    for r in results:
-        tt = r["task_type"]
-        if tt not in by_type:
-            by_type[tt] = {"total": 0, "success": 0}
-        by_type[tt]["total"] += 1
-        if r["success"]:
-            by_type[tt]["success"] += 1
-    for v in by_type.values():
-        v["rate"] = round(v["success"] / v["total"], 4) if v["total"] > 0 else 0
-    total_tokens = sum(r.get("total_tokens", 0) for r in results)
-    return {
-        "mode": mode,
-        "benchmark": "scienceworld",
-        "total_envs": total,
-        "total_success": successes,
-        "success_rate": round(successes / total, 4) if total > 0 else 0,
-        "avg_score": round(avg_score, 4),
-        "by_task_type": by_type,
-        "total_tokens": total_tokens,
-        "avg_tokens_per_episode": round(total_tokens / total) if total > 0 else 0,
-    }
+def compute_summary(results, mode, protocol=None):
+    return compute_scienceworld_summary(results, mode=mode, protocol=protocol)
 
 
 def compute_comparison(pass_results, reflection_stats):
@@ -291,8 +280,8 @@ def compute_comparison(pass_results, reflection_stats):
         entry["success_rate_delta"] = round(
             entry["passN_success_rate"] - entry["pass0_success_rate"], 4
         )
-        entry["pass0_avg_score"] = round((entry["pass0_score_sum"] / total) / 100.0, 4) if total else 0.0
-        entry["passN_avg_score"] = round((entry["passN_score_sum"] / total) / 100.0, 4) if total else 0.0
+        entry["pass0_avg_score"] = round(entry["pass0_score_sum"] / total, 4) if total else 0.0
+        entry["passN_avg_score"] = round(entry["passN_score_sum"] / total, 4) if total else 0.0
         entry["avg_score_delta"] = round(entry["passN_avg_score"] - entry["pass0_avg_score"], 4)
         del entry["pass0_score_sum"]
         del entry["passN_score_sum"]
@@ -319,9 +308,13 @@ def compute_comparison(pass_results, reflection_stats):
     }
 
 
-def build_run_payload(pass_results, episode_records, reflection_stats):
+def build_run_payload(pass_results, episode_records, reflection_stats, protocol=None):
     pass_summaries = {
-        f"pass{pass_idx}": compute_summary(results, f"reflexion_online_pass{pass_idx}")
+        f"pass{pass_idx}": compute_summary(
+            results,
+            f"reflexion_online_pass{pass_idx}",
+            protocol=protocol,
+        )
         for pass_idx, results in enumerate(pass_results)
     }
     return {
@@ -329,6 +322,7 @@ def build_run_payload(pass_results, episode_records, reflection_stats):
         "benchmark": "scienceworld",
         "num_passes": len(pass_results),
         "pass_summaries": pass_summaries,
+        "protocol": protocol,
         "comparison": compute_comparison(pass_results, reflection_stats),
         "episodes": episode_records,
     }
@@ -388,8 +382,23 @@ def main():
     env.setup()
 
     max_envs = min(args.max_envs or env.total_episodes, env.total_episodes)
+    protocol = build_protocol_metadata(
+        split=args.split,
+        tasks=task_names,
+        max_variations=args.max_variations,
+        step_limit=args.step_limit,
+        test_time_writable=bool(args.split == "test" and args.num_trials > 1),
+        memory_scope="episode_reflection",
+        max_envs=max_envs,
+    )
     env_configs = {
-        eidx: {"memory": [], "task_type": "", "task_description": "", "reflections_generated": 0}
+        eidx: {
+            "memory": [],
+            "task_type": "",
+            "variation_idx": None,
+            "task_description": "",
+            "reflections_generated": 0,
+        }
         for eidx in range(1, max_envs + 1)
     }
     pass_results = [[] for _ in range(args.num_trials)]
@@ -410,10 +419,11 @@ def main():
             try:
                 init_obs, task_type, info = env.reset_to_episode(env_idx - 1)
                 env_configs[env_idx]["task_type"] = task_type
+                env_configs[env_idx]["variation_idx"] = info.get("variation_idx")
                 env_configs[env_idx]["task_description"] = init_obs[:200]
                 result = run_episode(
-                    llm, env, env_idx, pass_idx, args.num_trials, task_type, init_obs,
-                    current_memory, args.step_limit,
+                    llm, env, env_idx, pass_idx, args.num_trials, task_type,
+                    info.get("variation_idx"), init_obs, current_memory, args.step_limit,
                 )
             except Exception as e:
                 task_type = env_configs[env_idx]["task_type"] or "unknown"
@@ -422,11 +432,14 @@ def main():
                     "env_idx": env_idx,
                     "pass_idx": pass_idx,
                     "task_type": task_type,
+                    "variation_idx": env_configs[env_idx]["variation_idx"],
                     "task_description": env_configs[env_idx]["task_description"],
                     "success": False,
-                    "score": 0.0,
+                    "score": -100.0,
                     "total_steps": 0,
                     "total_tokens": 0,
+                    "agent_tokens": 0,
+                    "reflection_tokens": 0,
                     "wall_time_s": 0.0,
                     "skipped": False,
                     "memory_items_used": min(len(current_memory), 3),
@@ -448,6 +461,12 @@ def main():
                         reflection = generate_reflection(
                             llm, result["log_str"], env_configs[env_idx]["memory"], domain="scienceworld",
                         )
+                        reflection_tokens = max(
+                            llm.tracker.summary()["total_tokens"] - result.get("agent_tokens", 0),
+                            0,
+                        )
+                        result["reflection_tokens"] = reflection_tokens
+                        result["total_tokens"] = result.get("total_tokens", 0) + reflection_tokens
                     except Exception as e:
                         reflection_stats["errors"] += 1
                         result["reflection_error"] = True
@@ -476,7 +495,11 @@ def main():
             pass_results[pass_idx].append(result)
             episode_passes.append(result)
 
-            summary = compute_summary(pass_results[pass_idx], f"reflexion_online_pass{pass_idx}")
+            summary = compute_summary(
+                pass_results[pass_idx],
+                f"reflexion_online_pass{pass_idx}",
+                protocol=protocol,
+            )
             status = "OK" if result["success"] else "FAIL"
             logger.info(
                 f"  [{env_idx}/{max_envs}] pass{pass_idx} {task_type:<30} {status:>4} "
@@ -486,29 +509,30 @@ def main():
         episode_records.append({
             "env_idx": env_idx,
             "task_type": env_configs[env_idx]["task_type"],
+            "variation_idx": env_configs[env_idx]["variation_idx"],
             "task_description": env_configs[env_idx]["task_description"],
             "memory": list(env_configs[env_idx]["memory"]),
             "reflections_generated": env_configs[env_idx]["reflections_generated"],
             "passes": strip_prompt_logs(episode_passes),
         })
 
-        payload = build_run_payload(pass_results, episode_records, reflection_stats)
+        payload = build_run_payload(pass_results, episode_records, reflection_stats, protocol=protocol)
         save_run_report(payload, checkpoint_path)
         logger.info(f"Checkpoint saved: {checkpoint_path}")
 
     env.close()
 
     for pass_idx, results in enumerate(pass_results):
-        summary = compute_summary(results, f"reflexion_online_pass{pass_idx}")
+        summary = compute_summary(results, f"reflexion_online_pass{pass_idx}", protocol=protocol)
         result_path = f"{results_dir}/{args.run_name}pass{pass_idx}.json"
         save_results(strip_prompt_logs(results), summary, result_path)
         logger.info(
             f"  Pass {pass_idx}: {summary['total_success']}/{summary['total_envs']} "
-            f"({summary['success_rate']:.1%}), avg_score={summary['avg_score']:.2%}"
+            f"({summary['success_rate']:.1%}), avg_score={summary['avg_score']:.2f}"
         )
         logger.info(f"Results saved: {result_path}")
 
-    final_payload = build_run_payload(pass_results, episode_records, reflection_stats)
+    final_payload = build_run_payload(pass_results, episode_records, reflection_stats, protocol=protocol)
     comparison_path = f"{results_dir}/{args.run_name}comparison.json"
     save_run_report(final_payload, comparison_path)
     logger.info(f"Comparison saved: {comparison_path}")

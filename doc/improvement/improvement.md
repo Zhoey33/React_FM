@@ -40,7 +40,7 @@ ScienceWorld 是论文主战场。所有紧急工作都先围绕它展开。
 
 - `scienceworld_step4_summary_cn.md` 中 React-FM Online 写的是 `64.25`。
 - 从源 JSON 逐 episode 重算可能是 `55.24`。
-- 正式论文只能保留一个口径，并说明是否使用 raw score、clamped score 或 normalized score。
+- 正式论文只保留 raw score 口径；clamped / normalized 只用于解释旧结果冲突。
 
 ### ALFWorld: 强辅助实验
 
@@ -91,7 +91,7 @@ WebShop 用来验证局部失败恢复是否能迁移到网页交互。
   - Avg Normalized Score。
   - Tokens / Episode。
   - Steps
-  - 必要时额外记录 clamped score，但不能和 raw score 混用。
+  - 不再额外记录 clamped / normalized score，避免和 raw score 混用。
 3. 固定 memory 粒度:
   - ScienceWorld memory 以 `task_type` 为主要 scope。
   - 记忆项保持 failure-recovery 结构。
@@ -177,7 +177,7 @@ WebShop 用来验证局部失败恢复是否能迁移到网页交互。
   - split、task list、variation、max envs、step limit、seed 是否一致。
   - env reset / skip / reset_to_episode 是否不会造成 episode index 错位。
 2. 指标协议:
-  - `success`、raw score、normalized score、clamped score 的定义固定。
+  - `success` 与 raw score 的定义固定。
   - summary 必须能从 episode JSON 逐条重算。
   - negative score 不能在不同方法间有的保留、有的 clamp。
 3. Prompt 协议:

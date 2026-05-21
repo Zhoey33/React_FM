@@ -31,6 +31,8 @@ from src.llm import LLMClient
 from src.expel_memory import InsightMemoryStore
 from src.expel_extractor import extract_insights_from_pair, extract_insights_from_failure
 from src.scienceworld_env import ScienceWorldEnv, DEFAULT_EVAL_TASKS
+from src.scienceworld_reporting import build_protocol_metadata
+from src.scienceworld_reporting import compute_summary as compute_scienceworld_summary
 from src.log_utils import setup_logging
 from prompts.scienceworld_prompts import get_fewshot_examples, SYSTEM_PROMPT_BASE
 
@@ -89,43 +91,14 @@ def save_results(results, summary, filepath):
         json.dump({"summary": summary, "episodes": results}, f, indent=2, ensure_ascii=False)
 
 
-def compute_summary(results, insight_stats, mode, extractor_tokens: int = 0):
-    total = len(results)
-    successes = sum(1 for r in results if r["success"])
-    # ScienceWorld scores use the native scale and can be negative; Step 4
-    # official reporting keeps those negative scores instead of clamping.
-    scores = [r.get("score", 0.0) / 100.0 for r in results]
-    avg_score = sum(scores) / len(scores) if scores else 0.0
-    by_type = {}
-    for r in results:
-        tt = r["task_type"]
-        if tt not in by_type:
-            by_type[tt] = {"total": 0, "success": 0}
-        by_type[tt]["total"] += 1
-        if r["success"]:
-            by_type[tt]["success"] += 1
-    for v in by_type.values():
-        v["rate"] = round(v["success"] / v["total"], 4) if v["total"] > 0 else 0
-    agent_tokens = sum(r.get("agent_tokens", r.get("total_tokens", 0)) for r in results)
-    stored_extractor_tokens = sum(r.get("extractor_tokens", 0) for r in results)
-    extractor_tokens_total = stored_extractor_tokens + extractor_tokens
-    total_tokens = agent_tokens + extractor_tokens_total
-    return {
-        "mode": mode,
-        "benchmark": "scienceworld",
-        "total_envs": total,
-        "total_success": successes,
-        "success_rate": round(successes / total, 4) if total > 0 else 0,
-        "avg_score": round(avg_score, 4),
-        "by_task_type": by_type,
-        "total_tokens": total_tokens,
-        "agent_tokens": agent_tokens,
-        "extractor_tokens": extractor_tokens_total,
-        "avg_tokens_per_episode": round(total_tokens / total) if total > 0 else 0,
-        "avg_agent_tokens_per_episode": round(agent_tokens / total) if total > 0 else 0,
-        "avg_extractor_tokens_per_episode": round(extractor_tokens_total / total) if total > 0 else 0,
-        "insight_stats": insight_stats,
-    }
+def compute_summary(results, insight_stats, mode, extractor_tokens: int = 0, protocol=None):
+    return compute_scienceworld_summary(
+        results,
+        mode=mode,
+        insight_stats=insight_stats,
+        protocol=protocol,
+        extra_tokens={"extractor_tokens": extractor_tokens},
+    )
 
 
 def build_expel_prompt(task_type, task_obs, history, insights=None):
@@ -144,7 +117,7 @@ def build_expel_prompt(task_type, task_obs, history, insights=None):
     return prompt
 
 
-def run_episode(llm, env, env_idx, task_type, init_obs, insight_store, max_steps, max_inject):
+def run_episode(llm, env, env_idx, task_type, variation_idx, init_obs, insight_store, max_steps, max_inject):
     """Run one ScienceWorld episode with optional ExpeL insight injection."""
     t0 = time.time()
     llm.tracker.reset()
@@ -208,6 +181,7 @@ def run_episode(llm, env, env_idx, task_type, init_obs, insight_store, max_steps
     return {
         "env_idx": env_idx,
         "task_type": task_type,
+        "variation_idx": variation_idx,
         "task_description": init_obs[:200],
         "success": success,
         "score": final_score,
@@ -283,6 +257,15 @@ def main():
 
         episode_results = []
         max_envs = args.max_envs or env.total_episodes
+        protocol = build_protocol_metadata(
+            split=args.split,
+            tasks=task_names,
+            max_variations=args.max_variations,
+            step_limit=args.step_limit,
+            test_time_writable=bool(args.split == "test"),
+            memory_scope="expel_insight",
+            max_envs=max_envs,
+        )
         env_count = 0
         num_skipped = 0
         epoch_extractor_tokens = 0
@@ -292,9 +275,12 @@ def main():
                 eidx = env_count + 1
 
                 if epoch > 1 and eidx in env_success:
+                    schedule = getattr(env, "_schedule", [])
+                    variation_idx = schedule[eidx - 1][1] if eidx - 1 < len(schedule) else None
                     env.skip()
                     episode_results.append({
                         "env_idx": eidx, "task_type": env_success[eidx],
+                        "variation_idx": variation_idx,
                         "task_description": "", "success": True, "score": 100.0,
                         "total_steps": 0, "total_tokens": 0,
                         "agent_tokens": 0, "extractor_tokens": 0,
@@ -307,7 +293,7 @@ def main():
                 init_obs, task_type, info = env.reset()
                 store_to_use = insight_store if epoch > 1 else None
                 result = run_episode(
-                    llm, env, eidx, task_type, init_obs,
+                    llm, env, eidx, task_type, info.get("variation_idx"), init_obs,
                     store_to_use, args.step_limit, args.max_insights_inject,
                 )
                 episode_results.append(result)
@@ -330,7 +316,12 @@ def main():
                             f"score={result['score']:.2f} running={rate:.1%}")
 
                 if env_count % 10 == 0:
-                    summary = compute_summary(episode_results, insight_store.stats(), "expel")
+                    summary = compute_summary(
+                        episode_results,
+                        insight_store.stats(),
+                        "expel",
+                        protocol=protocol,
+                    )
                     save_results(episode_results, summary,
                                  f"{results_dir}/{args.run_name}{epoch}_intermediate.json")
 
@@ -345,6 +336,11 @@ def main():
                 episode_results.append({
                     "env_idx": env_count + 1,
                     "task_type": task_type,
+                    "variation_idx": (
+                        schedule[env_count][1]
+                        if schedule and env_count < len(schedule)
+                        else None
+                    ),
                     "task_description": "",
                     "success": False,
                     "score": -100.0,
@@ -418,9 +414,10 @@ def main():
             insight_store.stats(),
             "expel",
             extractor_tokens=cumulative_extractor_tokens,
+            protocol=protocol,
         )
         logger.info(f"  Epoch {epoch}: {summary['total_success']}/{summary['total_envs']} "
-                    f"({summary['success_rate']:.1%}), avg_score={summary['avg_score']:.2%}")
+                    f"({summary['success_rate']:.1%}), avg_score={summary['avg_score']:.2f}")
         for tt, stats in sorted(summary["by_task_type"].items()):
             logger.info(f"    {tt:<30} {stats['success']}/{stats['total']} ({stats['rate']:.1%})")
 
