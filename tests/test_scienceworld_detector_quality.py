@@ -34,6 +34,9 @@ def _write_result_json(path):
                         "score_after_action": 0.0,
                         "failure_detected": True,
                         "failure_type": "precondition_blocked",
+                        "detector_source": "rule",
+                        "failure_reason": "Observation contains failure indicator.",
+                        "failure_confidence": None,
                     },
                     {
                         "step": 2,
@@ -66,6 +69,9 @@ def _write_result_json(path):
                         "score_after_action": 8.0,
                         "failure_detected": True,
                         "failure_type": "no_effect_or_other",
+                        "detector_source": "judge",
+                        "failure_reason": "No new progress.",
+                        "failure_confidence": 0.82,
                     },
                 ],
             },
@@ -112,6 +118,9 @@ def test_make_annotation_template_balances_predictions_and_skips_think_steps(tmp
         "score_after_action",
         "detector_prediction",
         "detector_failure_type",
+        "detector_source",
+        "failure_reason",
+        "failure_confidence",
         "gold_is_failure",
         "gold_failure_type",
         "gold_needs_repair",
@@ -132,6 +141,7 @@ def test_summarize_annotation_files_reports_detector_quality_metrics(tmp_path):
             "task_type": "melt",
             "detector_prediction": True,
             "detector_failure_type": "precondition_blocked",
+            "detector_source": "rule",
             "gold_is_failure": True,
             "gold_failure_type": "precondition_blocked",
         },
@@ -139,6 +149,7 @@ def test_summarize_annotation_files_reports_detector_quality_metrics(tmp_path):
             "task_type": "melt",
             "detector_prediction": True,
             "detector_failure_type": "no_effect_or_other",
+            "detector_source": "judge",
             "gold_is_failure": False,
             "gold_failure_type": "",
         },
@@ -146,6 +157,7 @@ def test_summarize_annotation_files_reports_detector_quality_metrics(tmp_path):
             "task_type": "boil",
             "detector_prediction": False,
             "detector_failure_type": "",
+            "detector_source": "",
             "gold_is_failure": True,
             "gold_failure_type": "wrong_location",
         },
@@ -153,6 +165,7 @@ def test_summarize_annotation_files_reports_detector_quality_metrics(tmp_path):
             "task_type": "boil",
             "detector_prediction": "false",
             "detector_failure_type": "",
+            "detector_source": "",
             "gold_is_failure": False,
             "gold_failure_type": "",
         },
@@ -160,6 +173,7 @@ def test_summarize_annotation_files_reports_detector_quality_metrics(tmp_path):
             "task_type": "boil",
             "detector_prediction": True,
             "detector_failure_type": "syntax_or_parse",
+            "detector_source": "rule",
             "gold_is_failure": True,
             "gold_failure_type": "wrong_location",
         },
@@ -187,6 +201,8 @@ def test_summarize_annotation_files_reports_detector_quality_metrics(tmp_path):
     }
     assert summary["by_task_type"]["melt"]["precision"] == 0.5
     assert summary["by_task_type"]["boil"]["recall"] == 0.5
+    assert summary["by_detector_source"]["rule"]["precision"] == 1.0
+    assert summary["by_detector_source"]["judge"]["precision"] == 0.0
     assert summary["by_detector_failure_type"]["precondition_blocked"]["type_accuracy"] == 1.0
     assert summary["by_gold_failure_type"]["wrong_location"]["recall"] == 0.5
 

@@ -9,6 +9,7 @@ judge:
   base_url: "https://api.siliconflow.cn/v1"
   temperature: 0.0
   max_tokens: 16
+  enable_implicit_failures: true
 
 extractor:
   model: "deepseek-ai/DeepSeek-V3.2"

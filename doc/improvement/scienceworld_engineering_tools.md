@@ -203,6 +203,9 @@ python analysis/scienceworld_detector_quality.py make-template \
   "score_after_action": 0.0,
   "detector_prediction": true,
   "detector_failure_type": "precondition_blocked",
+  "detector_source": "rule",
+  "failure_reason": "Observation contains failure indicator.",
+  "failure_confidence": null,
   "gold_is_failure": null,
   "gold_failure_type": "",
   "gold_needs_repair": null,
@@ -254,6 +257,7 @@ python analysis/scienceworld_detector_quality.py summarize \
     "false_negative_rate": 0.2727
   },
   "by_task_type": {},
+  "by_detector_source": {},
   "by_detector_failure_type": {},
   "by_gold_failure_type": {}
 }
@@ -266,6 +270,8 @@ python analysis/scienceworld_detector_quality.py summarize \
 - `type_accuracy`: TP 中 detector type 与 gold type 完全一致的比例。
 - `false_positive_rate = FP / (FP + TN)`。
 - `false_negative_rate = FN / (FN + TP)`。
+- 默认 detector 是 rule-first: 规则命中时 `detector_source=rule`，规则未命中才会调用 LLM judge，judge 命中时 `detector_source=judge`。
+- `by_detector_source` 主要用来看 rule/judge 各自触发后的 precision 与 type accuracy；recall 仍应以 `overall` 为准，因为 detector-negative 样本没有 rule/judge source。
 
 ## 6. Memory Generation Quality 标注与统计
 

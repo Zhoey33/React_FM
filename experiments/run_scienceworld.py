@@ -51,6 +51,9 @@ def parse_args():
                         default="failure_recovery", help="Memory storage format for ablation")
     parser.add_argument("--retrieval-mode", choices=["hybrid", "bm25_only", "embedding_only", "random"],
                         default="hybrid", help="Retrieval method for ablation")
+    parser.add_argument("--enable-implicit-failures", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="Enable or disable LLM judge implicit failure detection after rule checks")
     parser.add_argument("--split", choices=["train", "dev", "test"], default="test",
                         help="Official ScienceWorld split to run")
     parser.add_argument("--tasks", nargs="+", default=None, help="Specific task names to run")
@@ -83,6 +86,14 @@ def compute_summary(
         memory_stats=memory_stats,
         protocol=protocol,
     )
+
+
+def _resolve_enable_implicit_failures(args, config: dict) -> bool:
+    """Resolve ScienceWorld implicit judge detection from CLI first, then config."""
+    cli_value = getattr(args, "enable_implicit_failures", None)
+    if cli_value is not None:
+        return bool(cli_value)
+    return bool(config.get("judge", {}).get("enable_implicit_failures", True))
 
 
 def log_summary(summary: dict):
@@ -343,6 +354,9 @@ class ScienceWorldReActAgent:
                 "injected_memory_text": "",
                 "score_before_action": score_before_action,
                 "score_after_action": final_score,
+                "detector_source": "",
+                "failure_reason": "",
+                "failure_confidence": None,
             }
 
             if (
@@ -351,10 +365,22 @@ class ScienceWorldReActAgent:
                 and self.inject_mode in ("in_loop", "none")
                 and not is_done
             ):
-                det = self.detector.detect(observation, action, action_history)
+                det = self.detector.detect(
+                    observation,
+                    action,
+                    action_history,
+                    task_type=task_type,
+                    task_goal=init_obs,
+                    recent_history=history[-5:],
+                    score_before_action=score_before_action,
+                    score_after_action=final_score,
+                )
                 if det.is_failure:
                     record["failure_detected"] = True
                     record["failure_type"] = det.failure_type
+                    record["detector_source"] = det.detector_source
+                    record["failure_reason"] = det.reason
+                    record["failure_confidence"] = det.confidence
                     failures_detected += 1
                     logger.info(f"    FAILURE detected: {det.failure_type}")
 
@@ -513,7 +539,11 @@ def main():
             max_tokens=judge_cfg.get("max_tokens", 16),
         )
 
-    detector = None if is_baseline else ScienceWorldFailureDetector(judge_llm=judge_llm)
+    enable_implicit_failures = _resolve_enable_implicit_failures(args, config)
+    detector = None if is_baseline else ScienceWorldFailureDetector(
+        judge_llm=judge_llm,
+        enable_implicit_failures=enable_implicit_failures,
+    )
 
     extractor_llm = None
     if not is_baseline and "extractor" in config:
