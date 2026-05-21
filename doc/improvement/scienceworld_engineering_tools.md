@@ -394,7 +394,127 @@ python analysis/scienceworld_memory_quality.py summarize \
 - `duplicate_rate` 反映冗余记忆比例。
 - `overly_state_bound_rate` 越高，说明 memory 更像轨迹片段，泛化性可能较差。
 
-## 7. 建议使用顺序
+## 7. Post-Injection Correction 标注与统计
+
+用途:
+
+- 评估 memory 注入后，下一步 action 是否直接纠正当前 failure。
+- 输入是 `*_failure_events.jsonl`，不改 runner 或日志 schema。
+- v1 主口径是人工 `gold_corrected_next_action`，自动 recovered@1/@3 只作为并列 score 信号。
+
+### 7.1 生成标注模板
+
+命令:
+
+```bash
+python analysis/scienceworld_post_injection_correction.py make-template \
+  results/.../*_failure_events.jsonl \
+  --output analysis/post_injection_correction_annotations.jsonl \
+  --max-samples 200 \
+  --seed 0
+```
+
+说明:
+
+- 默认只抽真正发生注入的 event: `retrieval_hit=true` 或 `injected_memory_text` 非空。
+- 默认按 `task_type` 尽量均衡采样。
+- `--seed` 固定后，抽样结果可复现。
+- 无注入事件应看 recovered@k 或 detector quality，不进入本标注主样本。
+
+模板自动字段:
+
+```json
+{
+  "sample_id": "sw_post_injection_0001",
+  "source_file": "results/.../run_1_failure_events.jsonl",
+  "episode_id": "sw_007",
+  "env_idx": 7,
+  "task_type": "melt",
+  "variation_idx": 3,
+  "step": 18,
+  "failure_type": "precondition_blocked",
+  "failed_action": "go to workshop",
+  "failure_observation": "The door is not open.",
+  "retrieved_memory_ids": [12],
+  "injected_memory_text": "Open the workshop door before moving.",
+  "next_action": "open workshop door",
+  "memory_mode": "in_loop",
+  "retrieval_attempted": true,
+  "retrieval_hit": true,
+  "score_before_failure": 10.0,
+  "score_after_1_step": 10.0,
+  "score_after_2_steps": 14.0,
+  "score_after_3_steps": 14.0,
+  "recovered_within_1_step": false,
+  "recovered_within_3_steps": true
+}
+```
+
+人工填写字段:
+
+- `gold_corrected_next_action`: 注入后的 `next_action` 是否直接纠正当前 failure。
+- `gold_used_memory`: `next_action` 是否看起来使用了 injected memory。
+- `gold_injection_harmful`: 注入是否明显误导或造成更差行动。
+- `annotation_notes`: 简短备注。
+
+布尔字段可填 `true/false`、`yes/no`、`1/0`。
+
+### 7.2 统计标注结果
+
+命令:
+
+```bash
+python analysis/scienceworld_post_injection_correction.py summarize \
+  analysis/post_injection_correction_annotations.jsonl \
+  --output analysis/post_injection_correction_summary.json
+```
+
+如果还有未标注行，默认报错。想临时跳过:
+
+```bash
+python analysis/scienceworld_post_injection_correction.py summarize \
+  analysis/post_injection_correction_annotations.jsonl \
+  --output analysis/post_injection_correction_summary.json \
+  --allow-unlabeled
+```
+
+输出包含:
+
+- `overall`
+- `by_task_type`
+- `by_failure_type`
+- `by_memory_mode`
+- `by_retrieval_hit`
+- `by_gold_used_memory`
+
+每组重点字段:
+
+```json
+{
+  "total_samples": 200,
+  "corrected_next_action_count": 120,
+  "corrected_next_action_rate": 0.6,
+  "used_memory_count": 110,
+  "used_memory_rate": 0.55,
+  "harmful_count": 12,
+  "harmful_rate": 0.06,
+  "score_recovered_at_1_count": 70,
+  "score_recovered_at_1_rate": 0.35,
+  "score_recovered_at_3_count": 105,
+  "score_recovered_at_3_rate": 0.525,
+  "mean_score_delta_at_1": 0.8,
+  "mean_score_delta_at_3": 2.1
+}
+```
+
+解读:
+
+- `corrected_next_action_rate` 是本脚本的主人工指标。
+- `used_memory_rate` 辅助判断 correction 是否真的来自注入内容。
+- `harmful_rate` 用来量化错误注入的副作用。
+- `score_recovered_at_1/3` 是自动 raw score 信号，不能替代人工 correction label。
+
+## 8. 建议使用顺序
 
 1. 对旧结果先跑 raw 指标重算:
 
@@ -446,7 +566,25 @@ python analysis/scienceworld_memory_quality.py summarize \
   --output analysis/memory_quality_summary.json
 ```
 
-## 8. 当前完成状态
+8. 从 failure-event JSONL 抽 post-injection correction 标注模板:
+
+```bash
+python analysis/scienceworld_post_injection_correction.py make-template \
+  results/.../*_failure_events.jsonl \
+  --output analysis/post_injection_correction_annotations.jsonl \
+  --max-samples 200 \
+  --seed 0
+```
+
+9. 人工标注后统计 post-injection correction:
+
+```bash
+python analysis/scienceworld_post_injection_correction.py summarize \
+  analysis/post_injection_correction_annotations.jsonl \
+  --output analysis/post_injection_correction_summary.json
+```
+
+## 9. 当前完成状态
 
 已完成:
 
@@ -456,8 +594,8 @@ python analysis/scienceworld_memory_quality.py summarize \
 - recovered@1 / recovered@3 统计脚本。
 - detector quality 标注模板与统计脚本。
 - memory generation quality 标注模板与统计脚本。
+- post-injection correction 标注模板与统计脚本。
 
 下一步:
 
-- post-injection correction 标注/统计脚本。
 - context construction 优化。
