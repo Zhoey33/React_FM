@@ -30,6 +30,37 @@ def build_protocol_metadata(
     return metadata
 
 
+def _with_retrieval_observability(
+    memory_stats: dict[str, Any],
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Add gated ScienceWorld retrieval counters without mutating store stats."""
+    stats = dict(memory_stats)
+    attempted = 0
+    injection_hits = 0
+    injected_memories = 0
+    candidate_hits_from_steps = 0
+
+    for result in results:
+        for step in result.get("steps", []):
+            if step.get("retrieval_attempted"):
+                attempted += 1
+            candidate_count = int(step.get("retrieval_candidate_count") or 0)
+            if candidate_count > 0:
+                candidate_hits_from_steps += 1
+            memory_retrieved = int(step.get("memory_retrieved") or 0)
+            if memory_retrieved > 0:
+                injection_hits += 1
+                injected_memories += memory_retrieved
+
+    stats["candidate_retrievals"] = int(stats.get("total_retrievals", attempted))
+    stats["candidate_hits"] = int(stats.get("total_hits", candidate_hits_from_steps))
+    stats["in_loop_retrieval_attempts"] = attempted
+    stats["injection_hits"] = injection_hits
+    stats["injected_memories"] = injected_memories
+    return stats
+
+
 def compute_summary(
     results: list[dict[str, Any]],
     *,
@@ -97,7 +128,7 @@ def compute_summary(
     if protocol is not None:
         summary["protocol"] = protocol
     if memory_stats is not None:
-        summary["memory_stats"] = memory_stats
+        summary["memory_stats"] = _with_retrieval_observability(memory_stats, results)
     if insight_stats is not None:
         summary["insight_stats"] = insight_stats
         summary["avg_agent_tokens_per_episode"] = round(agent_tokens / total) if total else 0

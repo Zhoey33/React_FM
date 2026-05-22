@@ -454,6 +454,32 @@ def test_generate_rule_repair_advice_rejects_invalid_outputs():
         assert advice is None
 
 
+def test_generate_rule_repair_advice_requires_valid_action_when_available():
+    detector = ScienceWorldFailureDetector(
+        judge_llm=FakeJudgeLLM(
+            '{"repair_strategy": "Use the environment-supported thermometer action.", '
+            '"repair_action": "connect agent to thermometer", '
+            '"repair_confidence": 0.9, '
+            '"repair_rationale": "The previous action used invalid syntax."}'
+        ),
+        repair_confidence_threshold=0.7,
+    )
+
+    advice = detector.generate_rule_repair_advice(
+        action="focus on thermometer",
+        observation="No known action matches that input.",
+        failure_type="syntax_or_parse",
+        failure_reason="Action not recognized",
+        valid_actions_after_action=[
+            "look around",
+            "inventory",
+            "focus on substance called thermometer",
+        ],
+    )
+
+    assert advice is None
+
+
 def test_generate_rule_repair_advice_malformed_json_or_exception_returns_none():
     detectors = [
         ScienceWorldFailureDetector(judge_llm=FakeJudgeLLM("not json")),

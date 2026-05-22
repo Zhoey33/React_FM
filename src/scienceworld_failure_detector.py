@@ -349,6 +349,7 @@ class ScienceWorldFailureDetector:
                 _parse_repair_advice(
                     payload,
                     confidence_threshold=self.repair_confidence_threshold,
+                    valid_actions=valid_actions_after_action,
                 )
             )
             if not is_failure:
@@ -461,6 +462,7 @@ class ScienceWorldFailureDetector:
             strategy, repair_action, confidence, rationale = _parse_repair_advice(
                 payload,
                 confidence_threshold=self.repair_confidence_threshold,
+                valid_actions=valid_actions_after_action,
             )
             if not strategy or not repair_action or confidence is None:
                 logger.info(
@@ -544,6 +546,26 @@ def _format_valid_actions(valid_actions: str | list[str], max_items: int = 30) -
     return text
 
 
+def _valid_action_items(valid_actions: str | list[str]) -> list[str]:
+    if isinstance(valid_actions, str):
+        items = [line.strip() for line in valid_actions.splitlines() if line.strip()]
+    else:
+        items = [str(item).strip() for item in valid_actions if str(item).strip()]
+    return [item for item in items if item.lower() != "unknown"]
+
+
+def _normalize_action_text(action: str) -> str:
+    return " ".join(action.strip().lower().split())
+
+
+def _matches_available_action(action: str, valid_actions: str | list[str]) -> bool:
+    items = _valid_action_items(valid_actions)
+    if not items:
+        return True
+    normalized = _normalize_action_text(action)
+    return any(normalized == _normalize_action_text(item) for item in items)
+
+
 def _score_delta(
     score_before_action: float | int | None,
     score_after_action: float | int | None,
@@ -614,6 +636,7 @@ def _parse_repair_advice(
     payload: dict[str, Any],
     *,
     confidence_threshold: float,
+    valid_actions: str | list[str] = "",
 ) -> tuple[str, str, float | None, str]:
     strategy = str(payload.get("repair_strategy", "") or "").strip()
     action = str(payload.get("repair_action", "") or "").strip()
@@ -624,6 +647,8 @@ def _parse_repair_advice(
     if not strategy or not action:
         return "", "", confidence, rationale
     if not _looks_like_scienceworld_action(action):
+        return "", "", confidence, rationale
+    if not _matches_available_action(action, valid_actions):
         return "", "", confidence, rationale
     return strategy, action, confidence, rationale
 

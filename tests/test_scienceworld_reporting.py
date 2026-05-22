@@ -50,3 +50,47 @@ def test_summary_reports_only_raw_score_as_primary_score():
     assert summary["protocol"]["split"] == "test"
     assert summary["protocol"]["tasks"] == ["boil"]
     assert summary["protocol"]["test_time_writable"] is False
+
+
+def test_summary_distinguishes_candidate_hits_from_memory_injections():
+    results = [
+        {
+            "task_type": "melt",
+            "success": False,
+            "score": 10.0,
+            "total_steps": 3,
+            "total_tokens": 0,
+            "steps": [
+                {
+                    "retrieval_attempted": True,
+                    "retrieval_candidate_count": 2,
+                    "memory_retrieved": 0,
+                },
+                {
+                    "retrieval_attempted": True,
+                    "retrieval_candidate_count": 1,
+                    "memory_retrieved": 1,
+                },
+                {
+                    "retrieval_attempted": False,
+                    "memory_retrieved": 0,
+                },
+            ],
+        }
+    ]
+
+    summary = compute_summary(
+        results,
+        mode="react_fm",
+        memory_stats={
+            "total_entries": 3,
+            "total_retrievals": 2,
+            "total_hits": 2,
+        },
+    )
+
+    memory_stats = summary["memory_stats"]
+    assert memory_stats["candidate_retrievals"] == 2
+    assert memory_stats["candidate_hits"] == 2
+    assert memory_stats["in_loop_retrieval_attempts"] == 2
+    assert memory_stats["injection_hits"] == 1

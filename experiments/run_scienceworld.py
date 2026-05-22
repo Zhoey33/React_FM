@@ -121,8 +121,9 @@ def log_summary(summary: dict):
     if summary["memory_stats"]:
         ms = summary["memory_stats"]
         logger.info(f"  Memory: {ms.get('total_entries', 0)} entries, "
-                    f"{ms.get('total_retrievals', 0)} retrievals, "
-                    f"{ms.get('total_hits', 0)} hits")
+                    f"{ms.get('candidate_retrievals', ms.get('total_retrievals', 0))} retrievals, "
+                    f"{ms.get('candidate_hits', ms.get('total_hits', 0))} candidate hits, "
+                    f"{ms.get('injection_hits', 0)} injection hits")
     logger.info("=" * 60)
 
 
