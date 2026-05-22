@@ -140,7 +140,11 @@ def is_repair_compatible(
     if repair_frame.verb.isdigit() and current_failure_type == "ambiguity":
         return True
     if repair_frame.intent == "circuit_connection":
-        return _is_circuit_context(context) and not _has_bad_connect_object(repair_frame)
+        return (
+            current_frame.intent in {"circuit_connection", "generic_tool_use", "unknown"}
+            and _is_circuit_context(context)
+            and not _has_bad_connect_object(repair_frame)
+        )
     if repair_frame.verb == "connect":
         return False
     if _has_bad_fixture_container_operation(repair_frame):

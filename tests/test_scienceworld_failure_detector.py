@@ -652,6 +652,36 @@ def test_generate_rule_repair_advice_accepts_connect_action_in_circuit_context()
     assert advice.repair_action == "connect red wire to battery"
 
 
+def test_generate_rule_repair_advice_rejects_circuit_action_for_navigation_failure():
+    detector = ScienceWorldFailureDetector(
+        judge_llm=FakeJudgeLLM(
+            '{"repair_strategy": "Use available electrical components.", '
+            '"repair_action": "connect anode in battery to anode in orange light bulb", '
+            '"repair_confidence": 0.9, '
+            '"repair_rationale": "A battery is visible in the workshop."}'
+        ),
+        repair_confidence_threshold=0.7,
+    )
+
+    advice = detector.generate_rule_repair_advice(
+        action="go to kitchen",
+        observation="No known action matches that input.",
+        failure_type="syntax_or_parse",
+        failure_reason="Action not recognized",
+        task_goal="Your task is to melt lead.",
+        look_after_action="You see a battery, an orange light bulb, and a metal pot.",
+        valid_actions_after_action=[
+            "connect anode in battery to anode in orange light bulb",
+            "look around",
+            "inventory",
+        ],
+    )
+
+    assert advice is None
+    prompt = detector.judge_llm.prompts[0]["prompt"]
+    assert "connect anode in battery to anode in orange light bulb" not in prompt
+
+
 def test_generate_rule_repair_advice_accepts_numeric_ambiguity_choice_when_valid():
     detector = ScienceWorldFailureDetector(
         judge_llm=FakeJudgeLLM(
