@@ -25,6 +25,19 @@ def _write_failure_events(path):
             "retrieval_attempted": True,
             "retrieval_hit": True,
             "retrieved_memory_ids": [12],
+            "retrieved_memory_scores": [0.0327],
+            "retrieval_mode": "hybrid",
+            "retrieval_top_k": 1,
+            "retrieval_min_score": 0.0,
+            "retrieval_candidate_count": 4,
+            "retrieval_candidate_memory_ids": [12, 13],
+            "retrieval_candidate_scores": [0.0327, 0.0319],
+            "retrieval_candidate_relevance_scores": [0.75, 0.2],
+            "retrieval_selected_memory_id": 12,
+            "retrieval_relevance_decision": True,
+            "retrieval_rejection_reason": "",
+            "retrieval_filtered_by_type_count": 0,
+            "retrieval_filtered_by_safety_count": 1,
             "injected_memory_text": "Open the workshop door before moving.",
             "next_action": "open workshop door",
             "score_before_failure": 10.0,
@@ -47,6 +60,19 @@ def _write_failure_events(path):
             "retrieval_attempted": True,
             "retrieval_hit": "false",
             "retrieved_memory_ids": [],
+            "retrieved_memory_scores": [],
+            "retrieval_mode": "hybrid",
+            "retrieval_top_k": 1,
+            "retrieval_min_score": 0.0,
+            "retrieval_candidate_count": 0,
+            "retrieval_candidate_memory_ids": [],
+            "retrieval_candidate_scores": [],
+            "retrieval_candidate_relevance_scores": [],
+            "retrieval_selected_memory_id": None,
+            "retrieval_relevance_decision": False,
+            "retrieval_rejection_reason": "below_relevance_threshold",
+            "retrieval_filtered_by_type_count": 0,
+            "retrieval_filtered_by_safety_count": 0,
             "injected_memory_text": "Put the pot on the stove first.",
             "next_action": "put pot on stove",
             "score_before_failure": 20.0,
@@ -69,6 +95,19 @@ def _write_failure_events(path):
             "retrieval_attempted": False,
             "retrieval_hit": False,
             "retrieved_memory_ids": [],
+            "retrieved_memory_scores": [],
+            "retrieval_mode": "hybrid",
+            "retrieval_top_k": 1,
+            "retrieval_min_score": 0.0,
+            "retrieval_candidate_count": 0,
+            "retrieval_candidate_memory_ids": [],
+            "retrieval_candidate_scores": [],
+            "retrieval_candidate_relevance_scores": [],
+            "retrieval_selected_memory_id": None,
+            "retrieval_relevance_decision": False,
+            "retrieval_rejection_reason": "",
+            "retrieval_filtered_by_type_count": 0,
+            "retrieval_filtered_by_safety_count": 0,
             "injected_memory_text": "",
             "next_action": "look around",
             "score_before_failure": 0.0,
@@ -109,11 +148,24 @@ def test_make_post_injection_template_samples_injected_events_only(tmp_path):
         "failed_action",
         "failure_observation",
         "retrieved_memory_ids",
+        "retrieved_memory_scores",
         "injected_memory_text",
         "next_action",
         "memory_mode",
         "retrieval_attempted",
         "retrieval_hit",
+        "retrieval_mode",
+        "retrieval_top_k",
+        "retrieval_min_score",
+        "retrieval_candidate_count",
+        "retrieval_candidate_memory_ids",
+        "retrieval_candidate_scores",
+        "retrieval_candidate_relevance_scores",
+        "retrieval_selected_memory_id",
+        "retrieval_relevance_decision",
+        "retrieval_rejection_reason",
+        "retrieval_filtered_by_type_count",
+        "retrieval_filtered_by_safety_count",
         "score_before_failure",
         "score_after_1_step",
         "score_after_2_steps",
@@ -128,6 +180,17 @@ def test_make_post_injection_template_samples_injected_events_only(tmp_path):
     assert row["sample_id"].startswith("sw_post_injection_")
     assert row["source_file"] == str(event_path)
     assert row["retrieval_hit"] is True
+    assert row["retrieved_memory_scores"] == [0.0327]
+    assert row["retrieval_mode"] == "hybrid"
+    assert row["retrieval_top_k"] == 1
+    assert row["retrieval_min_score"] == 0.0
+    assert row["retrieval_candidate_count"] == 4
+    assert row["retrieval_candidate_memory_ids"] == [12, 13]
+    assert row["retrieval_candidate_scores"] == [0.0327, 0.0319]
+    assert row["retrieval_candidate_relevance_scores"] == [0.75, 0.2]
+    assert row["retrieval_selected_memory_id"] == 12
+    assert row["retrieval_relevance_decision"] is True
+    assert row["retrieval_filtered_by_safety_count"] == 1
     assert row["gold_corrected_next_action"] is None
     assert row["gold_used_memory"] is None
     assert row["gold_injection_harmful"] is None

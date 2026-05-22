@@ -8,8 +8,9 @@ judge:
   model: "deepseek-ai/DeepSeek-V3.2"
   base_url: "https://api.siliconflow.cn/v1"
   temperature: 0.0
-  max_tokens: 16
+  max_tokens: 256
   enable_implicit_failures: true
+  implicit_failure_confidence_threshold: 0.8
 
 extractor:
   model: "deepseek-ai/DeepSeek-V3.2"
@@ -27,7 +28,12 @@ memory:
   embedding_model: "all-MiniLM-L6-v2"
   max_entries: 500
   retrieval_top_k: 1
+  retrieval_candidate_k: 5
   min_score: 0.0
+  enable_failure_type_filter: true
+  enable_safety_gate: true
+  relevance_score_threshold: 0.45
+  enable_relevance_judge: false
   persist_dir: "./memory_store"
 
 experiment:

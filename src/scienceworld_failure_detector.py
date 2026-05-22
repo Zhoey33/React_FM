@@ -30,11 +30,14 @@ ALLOWED_JUDGE_FAILURE_TYPES = {
 
 JUDGE_PROMPT = """You are judging whether one ScienceWorld agent interaction is an implicit failure.
 
-Use the task goal, recent history, current action/observation, and score delta.
-The rule-based detector has already checked explicit environment errors, so only
-flag subtle failures where the current action likely did not help the task.
+Use the task goal, state context, recent history, current action/observation, and score delta.
+The rule-based detector has already checked explicit environment errors. You are the implicit
+failure judge and must be conservative: only flag a subtle failure when there is concrete
+evidence that the action wasted the step or moves away from the task.
 
 Task type: {task_type}
+Variation index: {variation_idx}
+Step: {step}
 
 Task goal / initial observation:
 {task_goal}
@@ -42,25 +45,49 @@ Task goal / initial observation:
 Recent history:
 {recent_history}
 
+Look before action:
+{look_before_action}
+
+Inventory before action:
+{inventory_before_action}
+
+Valid actions before action:
+{valid_actions_before_action}
+
 Current action: {action}
 Current observation: {observation}
 Score before action: {score_before_action}
 Score after action: {score_after_action}
 Score delta: {score_delta}
 
+Look after action:
+{look_after_action}
+
+Inventory after action:
+{inventory_after_action}
+
+Valid actions after action:
+{valid_actions_after_action}
+
 Guidance:
-- Productive actions may reveal new information, change state, or make task progress.
-- First-time look around, inventory, examine, and read actions are often productive.
-- wait can be productive when the task involves heating, cooling, growth, or time.
-- Repeating an action/observation with no new information and no score change is often a failure.
-- A legal action can still be an implicit failure if it is irrelevant, premature, or redundant.
+- Many necessary ScienceWorld actions do not immediately increase score.
+- Searching for objects, opening containers, examining empty containers, examining target objects,
+  measuring temperature, and waiting during heating/cooling/growth should NOT be failures solely
+  because score_delta is 0.
+- open drawer -> examine drawer is an information-gathering chain, not redundant_repeat.
+- redundant_repeat requires the same action or same target to be retried with the same outcome.
+- A legal action can still be an implicit failure only if it is irrelevant, premature, redundant,
+  or makes no progress according to concrete context evidence.
 
 Return ONLY valid JSON with this schema:
 {{
   "is_failure": true or false,
   "failure_type": "implicit_no_progress" | "redundant_repeat" | "irrelevant_action" | "premature_action" | "productive",
   "confidence": number between 0 and 1,
-  "reason": "short explanation"
+  "reason": "short explanation",
+  "evidence_for_failure": ["concrete evidence"],
+  "evidence_against_failure": ["counter-evidence"],
+  "productive_signal": "new_info" | "state_change" | "task_relevant_probe" | "time_progress" | "none"
 }}"""
 
 
@@ -71,6 +98,9 @@ class DetectionResult:
     reason: str = ""
     confidence: float | None = None
     detector_source: str = ""
+    evidence_for_failure: list[str] | None = None
+    evidence_against_failure: list[str] | None = None
+    productive_signal: str = ""
 
 
 class ScienceWorldFailureDetector:
@@ -79,10 +109,14 @@ class ScienceWorldFailureDetector:
         loop_window: int = 3,
         judge_llm: LLMClient | None = None,
         enable_implicit_failures: bool = False,
+        implicit_failure_confidence_threshold: float = 0.8,
+        judge_max_tokens: int = 256,
     ):
         self.loop_window = loop_window
         self.judge_llm = judge_llm
         self.enable_implicit_failures = enable_implicit_failures
+        self.implicit_failure_confidence_threshold = implicit_failure_confidence_threshold
+        self.judge_max_tokens = judge_max_tokens
 
     def detect(
         self,
@@ -94,6 +128,14 @@ class ScienceWorldFailureDetector:
         recent_history: list[tuple[str, str]] | list[dict[str, Any]] | None = None,
         score_before_action: float | int | None = None,
         score_after_action: float | int | None = None,
+        step: int | None = None,
+        variation_idx: int | None = None,
+        look_before_action: str = "",
+        inventory_before_action: str = "",
+        valid_actions_before_action: str | list[str] = "",
+        look_after_action: str = "",
+        inventory_after_action: str = "",
+        valid_actions_after_action: str | list[str] = "",
     ) -> DetectionResult:
         obs = observation.strip().lower()
 
@@ -146,6 +188,14 @@ class ScienceWorldFailureDetector:
                 recent_history=recent_history or [],
                 score_before_action=score_before_action,
                 score_after_action=score_after_action,
+                step=step,
+                variation_idx=variation_idx,
+                look_before_action=look_before_action,
+                inventory_before_action=inventory_before_action,
+                valid_actions_before_action=valid_actions_before_action,
+                look_after_action=look_after_action,
+                inventory_after_action=inventory_after_action,
+                valid_actions_after_action=valid_actions_after_action,
             )
 
         return DetectionResult(is_failure=False)
@@ -160,33 +210,90 @@ class ScienceWorldFailureDetector:
         recent_history: list[tuple[str, str]] | list[dict[str, Any]] | None = None,
         score_before_action: float | int | None = None,
         score_after_action: float | int | None = None,
+        step: int | None = None,
+        variation_idx: int | None = None,
+        look_before_action: str = "",
+        inventory_before_action: str = "",
+        valid_actions_before_action: str | list[str] = "",
+        look_after_action: str = "",
+        inventory_after_action: str = "",
+        valid_actions_after_action: str | list[str] = "",
     ) -> DetectionResult:
         prompt = JUDGE_PROMPT.format(
             action=action,
             observation=observation,
             task_type=task_type or "unknown",
+            variation_idx=variation_idx if variation_idx is not None else "unknown",
+            step=step if step is not None else "unknown",
             task_goal=_compact_text(task_goal or "unknown"),
             recent_history=_format_recent_history(recent_history or []),
             score_before_action=score_before_action,
             score_after_action=score_after_action,
             score_delta=_score_delta(score_before_action, score_after_action),
+            look_before_action=_compact_text(look_before_action or "unknown"),
+            inventory_before_action=_compact_text(inventory_before_action or "unknown"),
+            valid_actions_before_action=_format_valid_actions(valid_actions_before_action),
+            look_after_action=_compact_text(look_after_action or "unknown"),
+            inventory_after_action=_compact_text(inventory_after_action or "unknown"),
+            valid_actions_after_action=_format_valid_actions(valid_actions_after_action),
         )
         try:
-            response = self.judge_llm.complete_text(prompt, label="judge", max_tokens=160)
+            response = self.judge_llm.complete_text(
+                prompt,
+                label="judge",
+                max_tokens=self.judge_max_tokens,
+            )
             payload = _parse_judge_json(response)
             is_failure = _as_bool(payload.get("is_failure"))
+            confidence = _as_confidence(payload.get("confidence"))
+            evidence_for = _as_string_list(payload.get("evidence_for_failure"))
+            evidence_against = _as_string_list(payload.get("evidence_against_failure"))
+            productive_signal = str(payload.get("productive_signal", "") or "none").strip()
+            reason = str(payload.get("reason", "")).strip()
             if not is_failure:
+                logger.info(
+                    "Judge result: non_failure confidence=%s productive_signal=%s reason=%s",
+                    confidence,
+                    productive_signal,
+                    _compact_text(reason, max_chars=180),
+                )
                 return DetectionResult(is_failure=False)
 
             failure_type = str(payload.get("failure_type", "")).strip()
             if failure_type not in ALLOWED_JUDGE_FAILURE_TYPES:
                 failure_type = "implicit_no_progress"
+            if not _accept_judge_failure(
+                confidence=confidence,
+                evidence_for_failure=evidence_for,
+                productive_signal=productive_signal,
+                threshold=self.implicit_failure_confidence_threshold,
+            ):
+                logger.info(
+                    "Judge result rejected: type=%s confidence=%s productive_signal=%s "
+                    "evidence_for=%s reason=%s",
+                    failure_type,
+                    confidence,
+                    productive_signal,
+                    evidence_for,
+                    _compact_text(reason, max_chars=180),
+                )
+                return DetectionResult(is_failure=False)
+            logger.info(
+                "Judge result accepted: type=%s confidence=%s productive_signal=%s reason=%s",
+                failure_type,
+                confidence,
+                productive_signal,
+                _compact_text(reason, max_chars=180),
+            )
             return DetectionResult(
                 is_failure=True,
                 failure_type=failure_type,
-                reason=str(payload.get("reason", "")).strip(),
-                confidence=_as_confidence(payload.get("confidence")),
+                reason=reason,
+                confidence=confidence,
                 detector_source="judge",
+                evidence_for_failure=evidence_for,
+                evidence_against_failure=evidence_against,
+                productive_signal=productive_signal,
             )
         except Exception as e:
             logger.warning(f"Judge LLM call failed: {e}")
@@ -220,15 +327,34 @@ def _format_recent_history(
     lines = []
     for idx, item in enumerate(recent_history[-max_items:], start=1):
         if isinstance(item, dict):
+            step = item.get("step", idx - 1)
             action = item.get("action", "")
             observation = item.get("observation", "")
+            score = item.get("score", item.get("score_after_action", ""))
         else:
+            step = idx - 1
             action, observation = item
+            score = ""
         lines.append(
+            f"[history {idx}] Step: {step}\n"
             f"[history {idx}] Action: {_compact_text(str(action), max_chars=160)}\n"
-            f"[history {idx}] Observation: {_compact_text(str(observation), max_chars=240)}"
+            f"[history {idx}] Observation: {_compact_text(str(observation), max_chars=240)}\n"
+            f"[history {idx}] Score: {score}"
         )
     return "\n".join(lines)
+
+
+def _format_valid_actions(valid_actions: str | list[str], max_items: int = 30) -> str:
+    if isinstance(valid_actions, str):
+        items = [line.strip() for line in valid_actions.splitlines() if line.strip()]
+    else:
+        items = [str(item).strip() for item in valid_actions if str(item).strip()]
+    if not items:
+        return "unknown"
+    text = "\n".join(items[:max_items])
+    if len(items) > max_items:
+        text += f"\n... ({len(items) - max_items} more)"
+    return text
 
 
 def _score_delta(
@@ -287,3 +413,39 @@ def _as_confidence(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return max(0.0, min(1.0, confidence))
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _accept_judge_failure(
+    *,
+    confidence: float | None,
+    evidence_for_failure: list[str],
+    productive_signal: str,
+    threshold: float,
+) -> bool:
+    if confidence is None or confidence < threshold:
+        return False
+    if not evidence_for_failure:
+        return False
+    signal = (productive_signal or "none").strip().lower()
+    if signal in {"new_info", "state_change", "task_relevant_probe", "time_progress"}:
+        evidence_text = " ".join(evidence_for_failure).lower()
+        strong_failure_cues = (
+            "same action",
+            "same observation",
+            "repeat",
+            "repeated",
+            "unrelated",
+            "off task",
+            "premature",
+            "contradict",
+        )
+        return any(cue in evidence_text for cue in strong_failure_cues)
+    return True

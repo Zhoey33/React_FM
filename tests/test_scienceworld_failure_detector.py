@@ -60,11 +60,14 @@ def test_judge_is_not_called_when_implicit_failures_are_disabled():
 def test_enabled_judge_prompt_contains_context_and_parses_failure_json():
     judge = FakeJudgeLLM(
         '{"is_failure": true, "failure_type": "implicit_no_progress", '
-        '"confidence": 0.82, "reason": "The action repeated prior exploration."}'
+        '"confidence": 0.82, "reason": "The action repeated prior exploration.", '
+        '"evidence_for_failure": ["same action and same observation"], '
+        '"evidence_against_failure": [], "productive_signal": "none"}'
     )
     detector = ScienceWorldFailureDetector(
         judge_llm=judge,
         enable_implicit_failures=True,
+        implicit_failure_confidence_threshold=0.8,
     )
 
     result = detector.detect(
@@ -74,11 +77,19 @@ def test_enabled_judge_prompt_contains_context_and_parses_failure_json():
         task_type="melt",
         task_goal="Your task is to melt tin.",
         recent_history=[
-            ("inventory", "You have a metal pot."),
-            ("look around", "You see a kitchen."),
+            {"step": 0, "action": "inventory", "observation": "You have a metal pot.", "score": 10.0},
+            {"step": 1, "action": "look around", "observation": "You see a kitchen.", "score": 10.0},
         ],
         score_before_action=10.0,
         score_after_action=10.0,
+        step=2,
+        variation_idx=21,
+        look_before_action="This room is called the kitchen.",
+        inventory_before_action="In your inventory, you see: a metal pot.",
+        valid_actions_before_action=["look around", "inventory", "go to hallway"],
+        look_after_action="This room is called the kitchen.",
+        inventory_after_action="In your inventory, you see: a metal pot.",
+        valid_actions_after_action=["look around", "inventory", "go to hallway"],
     )
 
     assert result.is_failure is True
@@ -86,12 +97,16 @@ def test_enabled_judge_prompt_contains_context_and_parses_failure_json():
     assert result.detector_source == "judge"
     assert result.confidence == 0.82
     assert result.reason == "The action repeated prior exploration."
+    assert result.productive_signal == "none"
+    assert result.evidence_for_failure == ["same action and same observation"]
 
     call = judge.prompts[0]
     prompt = call["prompt"]
     assert call["label"] == "judge"
-    assert call["max_tokens"] == 160
+    assert call["max_tokens"] == 256
     assert "Task type: melt" in prompt
+    assert "Variation index: 21" in prompt
+    assert "Step: 2" in prompt
     assert "Task goal / initial observation:" in prompt
     assert "Your task is to melt tin." in prompt
     assert "[history 1] Action: inventory" in prompt
@@ -100,6 +115,13 @@ def test_enabled_judge_prompt_contains_context_and_parses_failure_json():
     assert "Score before action: 10.0" in prompt
     assert "Score after action: 10.0" in prompt
     assert "Score delta: 0.0" in prompt
+    assert "Look before action:" in prompt
+    assert "Inventory before action:" in prompt
+    assert "Valid actions before action:" in prompt
+    assert "Look after action:" in prompt
+    assert "Inventory after action:" in prompt
+    assert "Valid actions after action:" in prompt
+    assert "open drawer -> examine drawer" in prompt
 
 
 def test_judge_non_failure_json_returns_non_failure():
@@ -124,6 +146,132 @@ def test_judge_non_failure_json_returns_non_failure():
     assert result.is_failure is False
     assert result.failure_type == ""
     assert result.detector_source == ""
+
+
+def test_rule_miss_always_calls_judge_for_implicit_detection():
+    judge = FakeJudgeLLM(
+        '{"is_failure": false, "failure_type": "productive", '
+        '"confidence": 0.8, "reason": "This is task-relevant exploration.", '
+        '"evidence_for_failure": [], "evidence_against_failure": ["new container information"], '
+        '"productive_signal": "new_info"}'
+    )
+    detector = ScienceWorldFailureDetector(
+        judge_llm=judge,
+        enable_implicit_failures=True,
+    )
+
+    result = detector.detect(
+        observation="a drawer. In the drawer is: nothing",
+        action="examine drawer",
+        action_history=["open drawer", "examine drawer"],
+        task_type="melt",
+        task_goal="Your task is to melt tin.",
+        score_before_action=0,
+        score_after_action=0,
+    )
+
+    assert result.is_failure is False
+    assert len(judge.prompts) == 1
+
+
+def test_productive_signal_blocks_common_scienceworld_exploration_false_positives():
+    examples = [
+        ("examine drawer", "a drawer. In the drawer is: nothing", "new_info"),
+        ("open freezer", "The freezer is now open.", "state_change"),
+        ("examine freezer", "a freezer. The freezer door is open. In the freezer is: nothing.", "new_info"),
+        ("open fridge", "The fridge is now open.", "state_change"),
+        ("examine fridge", "a fridge. The fridge door is open. In the fridge is: a wood cup.", "new_info"),
+        ("examine tin cup", "a tin cup (containing nothing)", "task_relevant_probe"),
+        ("pick up thermometer", "You move the thermometer to the inventory.", "state_change"),
+        ("use thermometer on metal pot", "the thermometer measures a temperature of 149 degrees celsius", "new_info"),
+        ("wait", "You decide to wait for 10 iterations.", "time_progress"),
+    ]
+
+    for action, observation, productive_signal in examples:
+        judge = FakeJudgeLLM(
+            '{"is_failure": true, "failure_type": "irrelevant_action", '
+            '"confidence": 0.95, "reason": "No score increase.", '
+            '"evidence_for_failure": ["score did not increase"], '
+            '"evidence_against_failure": ["the action provides task-relevant information"], '
+            f'"productive_signal": "{productive_signal}"' + "}"
+        )
+        detector = ScienceWorldFailureDetector(
+            judge_llm=judge,
+            enable_implicit_failures=True,
+            implicit_failure_confidence_threshold=0.8,
+        )
+
+        result = detector.detect(
+            observation=observation,
+            action=action,
+            action_history=["open drawer", action],
+            task_type="boil",
+            task_goal="Your task is to boil tin.",
+            score_before_action=0,
+            score_after_action=0,
+        )
+
+        assert result.is_failure is False, action
+        assert len(judge.prompts) == 1
+
+
+def test_low_confidence_or_missing_evidence_judge_failure_is_rejected():
+    low_confidence = ScienceWorldFailureDetector(
+        judge_llm=FakeJudgeLLM(
+            '{"is_failure": true, "failure_type": "implicit_no_progress", '
+            '"confidence": 0.6, "reason": "Maybe unhelpful.", '
+            '"evidence_for_failure": ["weak guess"], '
+            '"evidence_against_failure": [], "productive_signal": "none"}'
+        ),
+        enable_implicit_failures=True,
+        implicit_failure_confidence_threshold=0.8,
+    )
+    missing_evidence = ScienceWorldFailureDetector(
+        judge_llm=FakeJudgeLLM(
+            '{"is_failure": true, "failure_type": "implicit_no_progress", '
+            '"confidence": 0.95, "reason": "No score increase.", '
+            '"evidence_for_failure": [], '
+            '"evidence_against_failure": [], "productive_signal": "none"}'
+        ),
+        enable_implicit_failures=True,
+        implicit_failure_confidence_threshold=0.8,
+    )
+
+    for detector in (low_confidence, missing_evidence):
+        result = detector.detect(
+            observation="The room looks unchanged.",
+            action="look around",
+            action_history=["inventory", "look around"],
+            score_before_action=5,
+            score_after_action=5,
+        )
+        assert result.is_failure is False
+
+
+def test_high_confidence_judge_failure_with_evidence_is_accepted():
+    judge = FakeJudgeLLM(
+        '{"is_failure": true, "failure_type": "redundant_repeat", '
+        '"confidence": 0.94, "reason": "The exact same command repeated with the same result.", '
+        '"evidence_for_failure": ["same action repeated three times", "same observation"], '
+        '"evidence_against_failure": [], "productive_signal": "none"}'
+    )
+    detector = ScienceWorldFailureDetector(
+        judge_llm=judge,
+        enable_implicit_failures=True,
+        implicit_failure_confidence_threshold=0.8,
+    )
+
+    result = detector.detect(
+        observation="The room looks unchanged.",
+        action="look around",
+        action_history=["inventory", "look around"],
+        score_before_action=5,
+        score_after_action=5,
+    )
+
+    assert result.is_failure is True
+    assert result.failure_type == "redundant_repeat"
+    assert result.detector_source == "judge"
 
 
 def test_judge_malformed_json_or_exception_safely_returns_non_failure():

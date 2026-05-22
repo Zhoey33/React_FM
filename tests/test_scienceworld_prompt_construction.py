@@ -141,6 +141,12 @@ class _MemoryHit:
 
     def __init__(self):
         self.entry = _memory_entry()
+        self.entry.failure_type = "implicit_no_progress"
+        self.entry.failure_action = "look around"
+        self.entry.failure_observation = "The room is unchanged."
+        self.entry.repair_action = "inventory"
+        self.entry.solution_action = "inventory"
+        self.entry.repair_strategy = "Check inventory instead of repeating exploration."
 
     def retrieve(self, **kwargs):
         return RetrievalResult([self.entry], [0.03], candidate_count=1)

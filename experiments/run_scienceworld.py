@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.llm import LLMClient
 from src.memory import FailureMemoryStore, RetrievalResult
+from src.scienceworld_retrieval_gate import select_retrieval_memory
 from src.scienceworld_failure_detector import ScienceWorldFailureDetector
 from src.scienceworld_env import ScienceWorldEnv, DEFAULT_EVAL_TASKS
 from src.scienceworld_failure_events import write_failure_events_jsonl
@@ -180,6 +181,14 @@ def _score_delta(before, after) -> float | None:
         return None
 
 
+def _compact_log_text(text, max_chars: int = 240) -> str:
+    """Compact long ScienceWorld text for readable INFO logs."""
+    compact = " ".join(str(text or "").replace("\t", " ").split())
+    if len(compact) > max_chars:
+        return compact[: max_chars - 3] + "..."
+    return compact
+
+
 def _infer_task_name_from_env(env) -> str:
     """Best-effort task name recovery for exception accounting."""
     schedule = getattr(env, "_schedule", None)
@@ -215,6 +224,19 @@ def _format_retrieved_memory_text(entries: list) -> str:
     return "\n".join(lines)
 
 
+def _format_memory_for_log(entry) -> str:
+    """Compact one retrieved memory for human audit logs."""
+    return (
+        f"failure_type={getattr(entry, 'failure_type', '')}; "
+        f"failure_action={_compact_log_text(getattr(entry, 'failure_action', ''), 120)}; "
+        f"failure_observation={_compact_log_text(getattr(entry, 'failure_observation', ''), 160)}; "
+        f"repair_strategy={_compact_log_text(getattr(entry, 'repair_strategy', ''), 160)}; "
+        f"repair_tactic={_compact_log_text(getattr(entry, 'repair_tactic', ''), 160)}; "
+        f"repair_action={_compact_log_text(getattr(entry, 'repair_action', '') or getattr(entry, 'solution_action', ''), 160)}; "
+        f"confidence_score={getattr(entry, 'confidence_score', None)}"
+    )
+
+
 def _unpack_retrieval_result(result) -> tuple[list, list[float], int]:
     """Normalize scored and legacy memory retrieval return values."""
     if isinstance(result, RetrievalResult):
@@ -239,6 +261,11 @@ class ScienceWorldReActAgent:
         memory_format: str = "failure_recovery",
         baseline_mode: bool = False,
         prompt_history_window: int = 10,
+        retrieval_candidate_k: int = 5,
+        enable_failure_type_filter: bool = True,
+        enable_safety_gate: bool = True,
+        relevance_score_threshold: float = 0.45,
+        enable_relevance_judge: bool = False,
     ):
         self.llm = llm
         self.memory = memory_store
@@ -252,6 +279,11 @@ class ScienceWorldReActAgent:
         self.memory_style = memory_style
         self.memory_format = memory_format
         self.prompt_history_window = prompt_history_window
+        self.retrieval_candidate_k = retrieval_candidate_k
+        self.enable_failure_type_filter = enable_failure_type_filter
+        self.enable_safety_gate = enable_safety_gate
+        self.relevance_score_threshold = relevance_score_threshold
+        self.enable_relevance_judge = enable_relevance_judge
 
     def _prompt_history(self, history: list[tuple[str, str]]) -> list[tuple[str, str]]:
         """Return the recent history slice used in ScienceWorld prompts."""
@@ -278,13 +310,26 @@ class ScienceWorldReActAgent:
 
         init_obs, task_type, info = env.reset()
         variation_idx = info.get("variation_idx")
+        task_goal = info.get("task_desc") or init_obs
 
         history: list[tuple[str, str]] = []
         action_history: list[str] = []
         steps: list[dict] = []
         env_history_records: list[dict] = []
+        detector_history: list[dict] = []
         success = False
         final_score = 0.0
+        current_look = info.get("look", "")
+        current_inventory = info.get("inventory", "")
+        current_valid_actions = info.get("valid_actions", "")
+
+        logger.info(
+            "Env #%s task=%s variation=%s",
+            env_idx,
+            task_type,
+            variation_idx,
+        )
+        logger.info("  Task goal: %s", _compact_log_text(task_goal, 500))
 
         current_retrieved = None
         current_failure_context = None
@@ -363,6 +408,9 @@ class ScienceWorldReActAgent:
                 consecutive_thinks = 0
 
             score_before_action = final_score
+            look_before_action = current_look
+            inventory_before_action = current_inventory
+            valid_actions_before_action = current_valid_actions
             observation, reward, done, step_info = env.step(action)
             logger.info(f"    obs: {observation[:80]}")
             action_history.append(action)
@@ -371,6 +419,9 @@ class ScienceWorldReActAgent:
             )
 
             final_score = step_info.get("score", final_score)
+            look_after_action = step_info.get("look", current_look)
+            inventory_after_action = step_info.get("inventory", current_inventory)
+            valid_actions_after_action = step_info.get("valid_actions", current_valid_actions)
             is_done, is_success = _is_task_complete(done, step_info)
 
             record = {
@@ -382,6 +433,14 @@ class ScienceWorldReActAgent:
                 "retrieval_top_k": self.max_memory_inject,
                 "retrieval_min_score": getattr(self.memory, "min_score", 0.0) if self.memory else 0.0,
                 "retrieval_candidate_count": 0,
+                "retrieval_candidate_memory_ids": [],
+                "retrieval_candidate_scores": [],
+                "retrieval_candidate_relevance_scores": [],
+                "retrieval_selected_memory_id": None,
+                "retrieval_relevance_decision": False,
+                "retrieval_rejection_reason": "",
+                "retrieval_filtered_by_type_count": 0,
+                "retrieval_filtered_by_safety_count": 0,
                 "retrieved_memory_ids": [],
                 "retrieved_memory_scores": [],
                 "injected_memory_text": "",
@@ -390,6 +449,9 @@ class ScienceWorldReActAgent:
                 "detector_source": "",
                 "failure_reason": "",
                 "failure_confidence": None,
+                "productive_signal": "",
+                "evidence_for_failure": [],
+                "evidence_against_failure": [],
             }
 
             if (
@@ -403,10 +465,18 @@ class ScienceWorldReActAgent:
                     action,
                     action_history,
                     task_type=task_type,
-                    task_goal=init_obs,
-                    recent_history=history[-5:],
+                    task_goal=task_goal,
+                    recent_history=detector_history[-10:],
                     score_before_action=score_before_action,
                     score_after_action=final_score,
+                    step=step_num,
+                    variation_idx=variation_idx,
+                    look_before_action=look_before_action,
+                    inventory_before_action=inventory_before_action,
+                    valid_actions_before_action=valid_actions_before_action,
+                    look_after_action=look_after_action,
+                    inventory_after_action=inventory_after_action,
+                    valid_actions_after_action=valid_actions_after_action,
                 )
                 if det.is_failure:
                     record["failure_detected"] = True
@@ -414,26 +484,83 @@ class ScienceWorldReActAgent:
                     record["detector_source"] = det.detector_source
                     record["failure_reason"] = det.reason
                     record["failure_confidence"] = det.confidence
+                    record["productive_signal"] = det.productive_signal
+                    record["evidence_for_failure"] = det.evidence_for_failure or []
+                    record["evidence_against_failure"] = det.evidence_against_failure or []
                     failures_detected += 1
-                    logger.info(f"    FAILURE detected: {det.failure_type}")
+                    logger.info(
+                        "    FAILURE detected: %s detector=%s confidence=%s "
+                        "productive_signal=%s score=%s->%s reason=%s",
+                        det.failure_type,
+                        det.detector_source,
+                        det.confidence,
+                        det.productive_signal,
+                        score_before_action,
+                        final_score,
+                        _compact_log_text(det.reason, 180),
+                    )
 
                     if self.inject_mode == "in_loop":
                         record["retrieval_attempted"] = True
                         retrieval_result = self.memory.retrieve(
                             query_action=action, query_observation=observation,
-                            task_type=task_type, top_k=self.max_memory_inject, env_idx=env_idx,
+                            query_failure_type=det.failure_type,
+                            task_type=task_type,
+                            top_k=self.max_memory_inject,
+                            candidate_k=self.retrieval_candidate_k,
+                            env_idx=env_idx,
                             return_scores=True,
                         )
-                        retrieved, retrieval_scores, candidate_count = _unpack_retrieval_result(
+                        candidates, candidate_scores, candidate_count = _unpack_retrieval_result(
                             retrieval_result
                         )
+                        decision = select_retrieval_memory(
+                            entries=candidates,
+                            retrieval_scores=candidate_scores,
+                            current_failure_type=det.failure_type,
+                            failed_action=action,
+                            failure_observation=observation,
+                            recent_actions=action_history,
+                            relevance_score_threshold=self.relevance_score_threshold,
+                            enable_failure_type_filter=self.enable_failure_type_filter,
+                            enable_safety_gate=self.enable_safety_gate,
+                        )
+                        retrieved = [decision.selected_entry] if decision.selected_entry else []
+                        selected_scores = []
+                        if decision.selected_memory_id in decision.candidate_memory_ids:
+                            selected_index = decision.candidate_memory_ids.index(
+                                decision.selected_memory_id
+                            )
+                            if selected_index < len(decision.candidate_scores):
+                                selected_scores = [decision.candidate_scores[selected_index]]
                         record["memory_retrieved"] = len(retrieved)
                         record["retrieval_candidate_count"] = candidate_count
-                        record["retrieved_memory_scores"] = retrieval_scores
+                        record["retrieval_candidate_memory_ids"] = decision.candidate_memory_ids
+                        record["retrieval_candidate_scores"] = decision.candidate_scores
+                        record["retrieval_candidate_relevance_scores"] = decision.relevance_scores
+                        record["retrieval_selected_memory_id"] = decision.selected_memory_id
+                        record["retrieval_relevance_decision"] = decision.relevance_decision
+                        record["retrieval_rejection_reason"] = decision.rejection_reason
+                        record["retrieval_filtered_by_type_count"] = (
+                            decision.filtered_by_type_count
+                        )
+                        record["retrieval_filtered_by_safety_count"] = (
+                            decision.filtered_by_safety_count
+                        )
+                        record["retrieved_memory_scores"] = selected_scores
                         record["retrieved_memory_ids"] = [
                             entry.memory_id for entry in retrieved
                         ]
                         record["injected_memory_text"] = _format_retrieved_memory_text(retrieved)
+                        logger.info(
+                            "    Retrieval candidates ids=%s scores=%s relevance=%s "
+                            "selected=%s reason=%s",
+                            decision.candidate_memory_ids,
+                            decision.candidate_scores,
+                            decision.relevance_scores,
+                            decision.selected_memory_id,
+                            decision.rejection_reason,
+                        )
                         memories_retrieved_total += len(retrieved)
                         if retrieved:
                             current_retrieved = retrieved
@@ -445,9 +572,26 @@ class ScienceWorldReActAgent:
                                 "failure_reason": det.reason,
                             }
                             logger.info(f"    Retrieved {len(retrieved)} memories")
+                            for entry in retrieved:
+                                logger.info(
+                                    "    Selected memory #%s: %s",
+                                    entry.memory_id,
+                                    _format_memory_for_log(entry),
+                                )
 
             steps.append(record)
             history.append((action, observation))
+            detector_history.append(
+                {
+                    "step": step_num,
+                    "action": action,
+                    "observation": observation,
+                    "score": final_score,
+                }
+            )
+            current_look = look_after_action
+            current_inventory = inventory_after_action
+            current_valid_actions = valid_actions_after_action
 
             if is_done:
                 success = is_success
@@ -598,6 +742,11 @@ def main():
     detector = None if is_baseline else ScienceWorldFailureDetector(
         judge_llm=judge_llm,
         enable_implicit_failures=enable_implicit_failures,
+        implicit_failure_confidence_threshold=config.get("judge", {}).get(
+            "implicit_failure_confidence_threshold",
+            0.8,
+        ),
+        judge_max_tokens=config.get("judge", {}).get("max_tokens", 256),
     )
 
     extractor_llm = None
@@ -624,6 +773,11 @@ def main():
         memory_format=args.memory_format,
         baseline_mode=is_baseline,
         prompt_history_window=config["agent"].get("prompt_history_window", 10),
+        retrieval_candidate_k=config["memory"].get("retrieval_candidate_k", 5),
+        enable_failure_type_filter=config["memory"].get("enable_failure_type_filter", True),
+        enable_safety_gate=config["memory"].get("enable_safety_gate", True),
+        relevance_score_threshold=config["memory"].get("relevance_score_threshold", 0.45),
+        enable_relevance_judge=config["memory"].get("enable_relevance_judge", False),
     )
 
     task_names = args.tasks or DEFAULT_EVAL_TASKS

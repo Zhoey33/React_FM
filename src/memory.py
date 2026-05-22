@@ -213,8 +213,21 @@ class FailureMemoryStore:
         """Simple whitespace + lowercase tokenization for BM25."""
         return text.lower().split()
 
-    def _build_query_text(self, action: str, observation: str) -> str:
-        return f"{action} | {observation}"
+    @staticmethod
+    def _build_query_text(action: str, observation: str, failure_type: str = "") -> str:
+        parts = []
+        if failure_type:
+            parts.append(f"Failure type: {failure_type}")
+        parts.extend([f"Action: {action}", f"Observation: {observation}"])
+        return " | ".join(parts)
+
+    @classmethod
+    def _build_memory_text(cls, entry: FailureMemoryEntry) -> str:
+        return cls._build_query_text(
+            entry.failure_action,
+            entry.failure_observation,
+            failure_type=entry.failure_type,
+        )
 
     def add(
         self,
@@ -237,7 +250,11 @@ class FailureMemoryStore:
         source_episode_score: float | None = None,
         confidence_score: float | None = None,
     ) -> FailureMemoryEntry:
-        query_text = self._build_query_text(failure_action, failure_observation)
+        query_text = self._build_query_text(
+            failure_action,
+            failure_observation,
+            failure_type=failure_type,
+        )
         embedding = self._embed(query_text)
 
         entry = FailureMemoryEntry(
@@ -285,9 +302,11 @@ class FailureMemoryStore:
         query_observation: str,
         task_type: str = "",
         top_k: int | None = None,
+        candidate_k: int | None = None,
         env_idx: int = 0,
         cross_env: bool = False,
         return_scores: bool = False,
+        query_failure_type: str = "",
     ) -> "list[FailureMemoryEntry] | RetrievalResult":
         """Retrieve relevant memories.
 
@@ -297,7 +316,7 @@ class FailureMemoryStore:
                            for backward compatibility.
         """
         self.total_retrievals += 1
-        k = top_k or self.top_k
+        k = candidate_k or top_k or self.top_k
 
         candidates = self.get_bucket_entries(
             task_type=task_type,
@@ -329,12 +348,16 @@ class FailureMemoryStore:
                 )
             return results
 
-        query_text = self._build_query_text(query_action, query_observation)
+        query_text = self._build_query_text(
+            query_action,
+            query_observation,
+            failure_type=query_failure_type,
+        )
 
         if self.retrieval_mode == "bm25_only":
             query_tokens = self._tokenize(query_text)
             corpus = [
-                self._tokenize(self._build_query_text(e.failure_action, e.failure_observation))
+                self._tokenize(self._build_memory_text(e))
                 for e in candidates
             ]
             bm25 = BM25Okapi(corpus)
@@ -379,7 +402,7 @@ class FailureMemoryStore:
 
         # --- BM25 ranking ---
         corpus = [
-            self._tokenize(self._build_query_text(e.failure_action, e.failure_observation))
+            self._tokenize(self._build_memory_text(e))
             for e in candidates
         ]
         bm25 = BM25Okapi(corpus)

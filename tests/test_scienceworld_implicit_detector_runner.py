@@ -1,8 +1,34 @@
 """Tests for wiring ScienceWorld implicit judge detection into the runner."""
 
+import logging
+
 from experiments import run_scienceworld
 from src.memory import RetrievalResult
 from src.scienceworld_failure_detector import DetectionResult
+
+
+class FakeMemoryEntry:
+    def __init__(
+        self,
+        memory_id=12,
+        failure_type="syntax_or_parse",
+        failure_action="open door to kitchen",
+        failure_observation="No known action matches that input.",
+        repair_action="open door to kitchen",
+        confidence_score=0.9,
+    ):
+        self.memory_id = memory_id
+        self.failure_type = failure_type
+        self.failure_action = failure_action
+        self.failure_observation = failure_observation
+        self.solution_action = repair_action
+        self.repair_strategy = "Use a valid action syntax."
+        self.repair_tactic = "Avoid repeating commands rejected by the environment."
+        self.repair_action = repair_action
+        self.confidence_score = confidence_score
+
+    def get_repair_display(self):
+        return self.repair_action
 
 
 class _Tracker:
@@ -43,25 +69,30 @@ class FakeDetector:
                 **kwargs,
             }
         )
-        return DetectionResult(
+        result = DetectionResult(
             is_failure=True,
             failure_type="implicit_no_progress",
             reason="No new information and score did not change.",
             confidence=0.9,
             detector_source="judge",
         )
+        result.productive_signal = "none"
+        result.evidence_for_failure = ["No new information."]
+        result.evidence_against_failure = []
+        return result
 
 
 class FakeMemory:
-    def __init__(self):
+    def __init__(self, retrieval_result=None):
         self.retrieve_calls = []
         self.add_calls = []
         self.min_score = 0.25
         self.retrieval_mode = "hybrid"
+        self.retrieval_result = retrieval_result or RetrievalResult([], [], candidate_count=4)
 
     def retrieve(self, **kwargs):
         self.retrieve_calls.append(kwargs)
-        return RetrievalResult([], [], candidate_count=4)
+        return self.retrieval_result
 
     def add(self, **kwargs):
         self.add_calls.append(kwargs)
@@ -75,7 +106,13 @@ class FakeEnv:
         return (
             "Your task is to melt tin.",
             "melt",
-            {"variation_idx": 3},
+            {
+                "variation_idx": 3,
+                "task_desc": "Your task is to melt tin.",
+                "look": "This room is called the kitchen.",
+                "inventory": "In your inventory, you see: nothing.",
+                "valid_actions": "look around\ninventory",
+            },
         )
 
     def step(self, action):
@@ -84,7 +121,12 @@ class FakeEnv:
             "You see the same room.",
             0.0,
             False,
-            {"score": 0.0},
+            {
+                "score": 0.0,
+                "look": "This room is called the kitchen.",
+                "inventory": "In your inventory, you see: nothing.",
+                "valid_actions": "look around\ninventory\ngo to hallway",
+            },
         )
 
 
@@ -164,8 +206,16 @@ def test_judge_detected_failure_triggers_retrieval_and_enters_extraction(monkeyp
     assert detector.calls[0]["task_type"] == "melt"
     assert detector.calls[0]["task_goal"] == "Your task is to melt tin."
     assert detector.calls[0]["recent_history"] == []
+    assert detector.calls[0]["step"] == 0
+    assert detector.calls[0]["variation_idx"] == 3
     assert detector.calls[0]["score_before_action"] == 0.0
     assert detector.calls[0]["score_after_action"] == 0.0
+    assert detector.calls[0]["look_before_action"] == "This room is called the kitchen."
+    assert detector.calls[0]["inventory_before_action"] == "In your inventory, you see: nothing."
+    assert detector.calls[0]["valid_actions_before_action"] == "look around\ninventory"
+    assert detector.calls[0]["look_after_action"] == "This room is called the kitchen."
+    assert detector.calls[0]["inventory_after_action"] == "In your inventory, you see: nothing."
+    assert detector.calls[0]["valid_actions_after_action"] == "look around\ninventory\ngo to hallway"
 
     step = result["steps"][0]
     assert step["failure_detected"] is True
@@ -173,9 +223,13 @@ def test_judge_detected_failure_triggers_retrieval_and_enters_extraction(monkeyp
     assert step["detector_source"] == "judge"
     assert step["failure_reason"] == "No new information and score did not change."
     assert step["failure_confidence"] == 0.9
+    assert step["productive_signal"] == "none"
+    assert step["evidence_for_failure"] == ["No new information."]
 
     assert memory.retrieve_calls
     assert memory.retrieve_calls[0]["return_scores"] is True
+    assert memory.retrieve_calls[0]["candidate_k"] == 5
+    assert memory.retrieve_calls[0]["query_failure_type"] == "implicit_no_progress"
     assert captured["detected_failures"] == [
         {
             "step": 0,
@@ -196,6 +250,47 @@ def test_judge_detected_failure_triggers_retrieval_and_enters_extraction(monkeyp
     assert memory.add_calls[0]["source_episode_score"] == 0.0
     assert memory.add_calls[0]["confidence_score"] == 0.9
     assert "question_text" not in memory.add_calls[0]
+
+
+def test_runner_logs_task_goal_and_retrieved_memory_content(caplog):
+    caplog.set_level(logging.INFO)
+    detector = FakeDetector()
+    memory = FakeMemory(
+        RetrievalResult(
+            [
+                FakeMemoryEntry(
+                    memory_id=21,
+                    failure_type="implicit_no_progress",
+                    failure_action="look around",
+                    failure_observation="You see the same room.",
+                    repair_action="inventory",
+                    confidence_score=0.88,
+                )
+            ],
+            [0.04],
+            candidate_count=1,
+        )
+    )
+    agent = run_scienceworld.ScienceWorldReActAgent(
+        llm=FakeLLM(),
+        memory_store=memory,
+        failure_detector=detector,
+        extractor_llm=None,
+        max_steps=1,
+        enable_memory=True,
+        inject_mode="in_loop",
+    )
+
+    agent.run_episode(FakeEnv(), env_idx=7)
+
+    log_text = caplog.text
+    assert "Task goal:" in log_text
+    assert "Your task is to melt tin." in log_text
+    assert "detector=judge" in log_text
+    assert "productive_signal=none" in log_text
+    assert "Retrieval candidates ids=[21]" in log_text
+    assert "Selected memory #21" in log_text
+    assert "repair_action=inventory" in log_text
 
 
 def test_retrieval_observability_fields_are_recorded_for_failure_step():
@@ -221,3 +316,46 @@ def test_retrieval_observability_fields_are_recorded_for_failure_step():
     assert step["retrieval_min_score"] == 0.25
     assert step["retrieval_candidate_count"] == 4
     assert step["retrieved_memory_scores"] == []
+    assert step["retrieval_candidate_memory_ids"] == []
+    assert step["retrieval_candidate_scores"] == []
+    assert step["retrieval_candidate_relevance_scores"] == []
+    assert step["retrieval_selected_memory_id"] is None
+    assert step["retrieval_relevance_decision"] is False
+    assert step["retrieval_rejection_reason"] == "no_candidates"
+
+
+def test_gated_retrieval_records_candidates_without_injecting_rejected_memory():
+    detector = FakeDetector()
+    memory = FakeMemory(
+        RetrievalResult(
+            [FakeMemoryEntry()],
+            [0.0327],
+            candidate_count=1,
+        )
+    )
+    agent = run_scienceworld.ScienceWorldReActAgent(
+        llm=FakeLLM(),
+        memory_store=memory,
+        failure_detector=detector,
+        extractor_llm=None,
+        max_steps=1,
+        max_memory_inject=1,
+        enable_memory=True,
+        inject_mode="in_loop",
+        retrieval_candidate_k=5,
+        relevance_score_threshold=0.45,
+    )
+
+    result = agent.run_episode(FakeEnv(), env_idx=7)
+
+    step = result["steps"][0]
+    assert step["retrieval_attempted"] is True
+    assert step["memory_retrieved"] == 0
+    assert step["retrieved_memory_ids"] == []
+    assert step["retrieved_memory_scores"] == []
+    assert step["retrieval_candidate_memory_ids"] == [12]
+    assert step["retrieval_candidate_scores"] == [0.0327]
+    assert step["retrieval_candidate_relevance_scores"] == [0.0]
+    assert step["retrieval_selected_memory_id"] is None
+    assert step["retrieval_relevance_decision"] is False
+    assert step["retrieval_rejection_reason"] == "no_type_compatible_candidates"

@@ -52,6 +52,12 @@ def build_failure_events(episode: dict[str, Any], *, memory_mode: str) -> list[d
                 "variation_idx": episode.get("variation_idx"),
                 "step": step.get("step"),
                 "failure_type": step.get("failure_type", ""),
+                "detector_source": step.get("detector_source", ""),
+                "failure_reason": step.get("failure_reason", ""),
+                "failure_confidence": step.get("failure_confidence"),
+                "productive_signal": step.get("productive_signal", ""),
+                "evidence_for_failure": step.get("evidence_for_failure", []),
+                "evidence_against_failure": step.get("evidence_against_failure", []),
                 "failed_action": step.get("action", ""),
                 "failure_observation": step.get("observation", ""),
                 "memory_mode": memory_mode,
@@ -63,6 +69,22 @@ def build_failure_events(episode: dict[str, Any], *, memory_mode: str) -> list[d
                 "retrieval_top_k": step.get("retrieval_top_k"),
                 "retrieval_min_score": step.get("retrieval_min_score"),
                 "retrieval_candidate_count": step.get("retrieval_candidate_count", 0),
+                "retrieval_candidate_memory_ids": step.get("retrieval_candidate_memory_ids", []),
+                "retrieval_candidate_scores": step.get("retrieval_candidate_scores", []),
+                "retrieval_candidate_relevance_scores": step.get(
+                    "retrieval_candidate_relevance_scores", []
+                ),
+                "retrieval_selected_memory_id": step.get("retrieval_selected_memory_id"),
+                "retrieval_relevance_decision": bool(
+                    step.get("retrieval_relevance_decision", retrieval_hit)
+                ),
+                "retrieval_rejection_reason": step.get("retrieval_rejection_reason", ""),
+                "retrieval_filtered_by_type_count": step.get(
+                    "retrieval_filtered_by_type_count", 0
+                ),
+                "retrieval_filtered_by_safety_count": step.get(
+                    "retrieval_filtered_by_safety_count", 0
+                ),
                 "injected_memory_text": step.get("injected_memory_text", ""),
                 "next_action": steps[index + 1].get("action", "") if index + 1 < len(steps) else "",
                 "score_before_failure": score_before,

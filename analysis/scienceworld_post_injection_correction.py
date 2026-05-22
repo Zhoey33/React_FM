@@ -84,11 +84,28 @@ def _event_to_annotation(*, source_file: str, event: dict[str, Any]) -> dict[str
         "failed_action": event.get("failed_action", ""),
         "failure_observation": event.get("failure_observation", ""),
         "retrieved_memory_ids": event.get("retrieved_memory_ids", []),
+        "retrieved_memory_scores": event.get("retrieved_memory_scores", []),
         "injected_memory_text": event.get("injected_memory_text", ""),
         "next_action": event.get("next_action", ""),
         "memory_mode": event.get("memory_mode", "unknown"),
         "retrieval_attempted": _as_bool(event.get("retrieval_attempted")),
         "retrieval_hit": _as_bool(event.get("retrieval_hit")),
+        "retrieval_mode": event.get("retrieval_mode", ""),
+        "retrieval_top_k": event.get("retrieval_top_k"),
+        "retrieval_min_score": event.get("retrieval_min_score"),
+        "retrieval_candidate_count": event.get("retrieval_candidate_count"),
+        "retrieval_candidate_memory_ids": event.get("retrieval_candidate_memory_ids", []),
+        "retrieval_candidate_scores": event.get("retrieval_candidate_scores", []),
+        "retrieval_candidate_relevance_scores": event.get(
+            "retrieval_candidate_relevance_scores", []
+        ),
+        "retrieval_selected_memory_id": event.get("retrieval_selected_memory_id"),
+        "retrieval_relevance_decision": _as_bool(event.get("retrieval_relevance_decision")),
+        "retrieval_rejection_reason": event.get("retrieval_rejection_reason", ""),
+        "retrieval_filtered_by_type_count": event.get("retrieval_filtered_by_type_count", 0),
+        "retrieval_filtered_by_safety_count": event.get(
+            "retrieval_filtered_by_safety_count", 0
+        ),
         "score_before_failure": event.get("score_before_failure"),
         "score_after_1_step": event.get("score_after_1_step"),
         "score_after_2_steps": event.get("score_after_2_steps"),
