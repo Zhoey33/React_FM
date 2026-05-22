@@ -2,10 +2,16 @@
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from src.llm import LLMClient
+from src.scienceworld_action_intent import (
+    filter_valid_actions_for_repair,
+    is_repair_compatible,
+    parse_action_intent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +92,8 @@ Guidance:
 - redundant_repeat requires the same action or same target to be retried with the same outcome.
 - A legal action can still be an implicit failure only if it is irrelevant, premature, redundant,
   or makes no progress according to concrete context evidence.
+- If is_failure is false, keep evidence_for_failure and evidence_against_failure as empty arrays.
+- If is_failure is true, use at most one evidence item per list, each under 8 words.
 
 Return ONLY valid JSON with this schema:
 {{
@@ -95,16 +103,10 @@ Return ONLY valid JSON with this schema:
   "reason": "short explanation",
   "evidence_for_failure": ["concrete evidence"],
   "evidence_against_failure": ["counter-evidence"],
-  "productive_signal": "new_info" | "state_change" | "task_relevant_probe" | "time_progress" | "none",
-  "repair_strategy": "high-level immediate repair direction, or empty string",
-  "repair_action": "one valid next ScienceWorld action, or empty string",
-  "repair_confidence": number between 0 and 1,
-  "repair_rationale": "short explanation for the suggested repair"
+  "productive_signal": "new_info" | "state_change" | "task_relevant_probe" | "time_progress" | "none"
 }}
 
-Keep reason/rationale under 25 words. Use at most 2 evidence items per list.
-If is_failure is false, set repair_strategy, repair_action, and repair_rationale to empty strings,
-and repair_confidence to 0.0."""
+Keep reason under 25 words. Use at most 2 evidence items per list."""
 
 
 RULE_REPAIR_PROMPT = """You are generating one immediate repair suggestion for a ScienceWorld agent.
@@ -173,6 +175,8 @@ class DetectionResult:
     judge_repair_confidence: float | None = None
     judge_repair_rationale: str = ""
     judge_advice_source: str = ""
+    judge_cache_hit: bool = False
+    judge_call_type: str = ""
 
     @property
     def has_judge_repair_advice(self) -> bool:
@@ -196,14 +200,27 @@ class ScienceWorldFailureDetector:
         enable_implicit_failures: bool = False,
         implicit_failure_confidence_threshold: float = 0.8,
         judge_max_tokens: int = 512,
+        detector_max_tokens: int | None = None,
+        repair_max_tokens: int | None = None,
         repair_confidence_threshold: float = 0.7,
+        enable_cache: bool = False,
+        enable_repair_intent_filter: bool = True,
     ):
         self.loop_window = loop_window
         self.judge_llm = judge_llm
         self.enable_implicit_failures = enable_implicit_failures
         self.implicit_failure_confidence_threshold = implicit_failure_confidence_threshold
         self.judge_max_tokens = judge_max_tokens
+        self.detector_max_tokens = detector_max_tokens if detector_max_tokens is not None else 128
+        self.repair_max_tokens = repair_max_tokens if repair_max_tokens is not None else 192
         self.repair_confidence_threshold = repair_confidence_threshold
+        self.enable_cache = enable_cache
+        self.enable_repair_intent_filter = enable_repair_intent_filter
+        self._judge_cache: dict[tuple[str, str, str, str, str], DetectionResult] = {}
+
+    def reset_judge_cache(self) -> None:
+        """Clear per-episode implicit judge decisions."""
+        self._judge_cache.clear()
 
     def detect(
         self,
@@ -306,6 +323,19 @@ class ScienceWorldFailureDetector:
         inventory_after_action: str = "",
         valid_actions_after_action: str | list[str] = "",
     ) -> DetectionResult:
+        cache_key = _judge_cache_key(
+            task_type=task_type,
+            task_goal=task_goal,
+            action=action,
+            observation=observation,
+            score_delta=_score_delta(score_before_action, score_after_action),
+        )
+        if self.enable_cache and cache_key in self._judge_cache:
+            cached = _clone_detection_result(self._judge_cache[cache_key])
+            cached.judge_cache_hit = True
+            cached.judge_call_type = "cache"
+            return cached
+
         prompt = JUDGE_PROMPT.format(
             action=action,
             observation=observation,
@@ -313,7 +343,7 @@ class ScienceWorldFailureDetector:
             variation_idx=variation_idx if variation_idx is not None else "unknown",
             step=step if step is not None else "unknown",
             task_goal=_compact_text(task_goal or "unknown"),
-            recent_history=_format_recent_history(recent_history or []),
+            recent_history=_format_recent_history(recent_history or [], max_items=5),
             score_before_action=score_before_action,
             score_after_action=score_after_action,
             score_delta=_score_delta(score_before_action, score_after_action),
@@ -350,30 +380,37 @@ class ScienceWorldFailureDetector:
             response = self.judge_llm.complete_text(
                 prompt,
                 label="judge",
-                max_tokens=self.judge_max_tokens,
+                max_tokens=self.detector_max_tokens,
             )
             try:
                 payload = _parse_judge_json(response)
             except (json.JSONDecodeError, ValueError) as e:
+                fallback = _parse_truncated_non_failure_judge(response)
+                if fallback is not None:
+                    logger.info(
+                        "Judge truncated non-failure parsed conservatively: confidence=%s "
+                        "reason=%s",
+                        fallback.confidence,
+                        _compact_text(fallback.reason, max_chars=180),
+                    )
+                    fallback.judge_call_type = "implicit_detector"
+                    self._store_judge_cache_result(cache_key, fallback)
+                    return fallback
                 logger.warning(
                     "Judge JSON parse failed: %s response=%s",
                     e,
                     _compact_text(response, max_chars=500),
                 )
-                return DetectionResult(is_failure=False)
+                return DetectionResult(
+                    is_failure=False,
+                    judge_call_type="implicit_detector",
+                )
             is_failure = _as_bool(payload.get("is_failure"))
             confidence = _as_confidence(payload.get("confidence"))
             evidence_for = _as_string_list(payload.get("evidence_for_failure"))
             evidence_against = _as_string_list(payload.get("evidence_against_failure"))
             productive_signal = str(payload.get("productive_signal", "") or "none").strip()
             reason = str(payload.get("reason", "")).strip()
-            repair_strategy, repair_action, repair_confidence, repair_rationale = (
-                _parse_repair_advice(
-                    payload,
-                    confidence_threshold=self.repair_confidence_threshold,
-                    valid_actions=valid_actions_after_action,
-                )
-            )
             if not is_failure:
                 logger.info(
                     "Judge result: non_failure confidence=%s productive_signal=%s reason=%s",
@@ -381,7 +418,17 @@ class ScienceWorldFailureDetector:
                     productive_signal,
                     _compact_text(reason, max_chars=180),
                 )
-                return DetectionResult(is_failure=False)
+                result = DetectionResult(
+                    is_failure=False,
+                    judge_call_type="implicit_detector",
+                    confidence=confidence,
+                    reason=reason,
+                    evidence_for_failure=evidence_for,
+                    evidence_against_failure=evidence_against,
+                    productive_signal=productive_signal,
+                )
+                self._store_judge_cache_result(cache_key, result)
+                return result
 
             failure_type = str(payload.get("failure_type", "")).strip()
             if failure_type not in ALLOWED_JUDGE_FAILURE_TYPES:
@@ -401,7 +448,17 @@ class ScienceWorldFailureDetector:
                     evidence_for,
                     _compact_text(reason, max_chars=180),
                 )
-                return DetectionResult(is_failure=False)
+                result = DetectionResult(
+                    is_failure=False,
+                    judge_call_type="implicit_detector",
+                    confidence=confidence,
+                    reason=reason,
+                    evidence_for_failure=evidence_for,
+                    evidence_against_failure=evidence_against,
+                    productive_signal=productive_signal,
+                )
+                self._store_judge_cache_result(cache_key, result)
+                return result
             logger.info(
                 "Judge result accepted: type=%s confidence=%s productive_signal=%s reason=%s",
                 failure_type,
@@ -409,7 +466,7 @@ class ScienceWorldFailureDetector:
                 productive_signal,
                 _compact_text(reason, max_chars=180),
             )
-            return DetectionResult(
+            result = DetectionResult(
                 is_failure=True,
                 failure_type=failure_type,
                 reason=reason,
@@ -418,23 +475,30 @@ class ScienceWorldFailureDetector:
                 evidence_for_failure=evidence_for,
                 evidence_against_failure=evidence_against,
                 productive_signal=productive_signal,
-                judge_repair_strategy=repair_strategy,
-                judge_repair_action=repair_action,
-                judge_repair_confidence=repair_confidence,
-                judge_repair_rationale=repair_rationale,
-                judge_advice_source="implicit_judge" if repair_strategy and repair_action else "",
+                judge_call_type="implicit_detector",
             )
+            self._store_judge_cache_result(cache_key, result)
+            return result
         except Exception as e:
             logger.warning(f"Judge LLM call failed: {e}")
-        return DetectionResult(is_failure=False)
+        return DetectionResult(is_failure=False, judge_call_type="implicit_detector")
 
-    def generate_rule_repair_advice(
+    def _store_judge_cache_result(
+        self,
+        cache_key: tuple[str, str, str, str, str],
+        result: DetectionResult,
+    ) -> None:
+        if self.enable_cache:
+            self._judge_cache[cache_key] = _clone_detection_result(result)
+
+    def generate_repair_advice(
         self,
         *,
         action: str,
         observation: str,
         failure_type: str,
         failure_reason: str,
+        advice_source: str = "rule_repair_judge",
         task_type: str = "",
         task_goal: str = "",
         recent_history: list[tuple[str, str]] | list[dict[str, Any]] | None = None,
@@ -446,9 +510,30 @@ class ScienceWorldFailureDetector:
         inventory_after_action: str = "",
         valid_actions_after_action: str | list[str] = "",
     ) -> RepairAdvice | None:
-        """Ask the judge LLM for one repair action after a rule-detected failure."""
+        """Ask the judge LLM for one repair action after a detected failure."""
         if self.judge_llm is None:
             return None
+        repair_context = " ".join(
+            [
+                str(task_goal or ""),
+                str(action or ""),
+                str(observation or ""),
+                str(failure_type or ""),
+                str(look_after_action or ""),
+                str(inventory_after_action or ""),
+            ]
+        )
+        current_frame = parse_action_intent(action, context=repair_context)
+        filtered_valid_actions = (
+            filter_valid_actions_for_repair(
+                valid_actions_after_action,
+                current_frame,
+                failure_type=failure_type,
+                context=repair_context,
+            )
+            if self.enable_repair_intent_filter
+            else valid_actions_after_action
+        )
         prompt = RULE_REPAIR_PROMPT.format(
             action=action,
             observation=observation,
@@ -465,7 +550,7 @@ class ScienceWorldFailureDetector:
             look_after_action=_compact_text(look_after_action or "unknown"),
             inventory_after_action=_compact_text(inventory_after_action or "unknown"),
             valid_actions_after_action=_format_valid_actions(
-                valid_actions_after_action,
+                filtered_valid_actions,
                 context_text=" ".join(
                     [
                         str(task_goal or ""),
@@ -481,7 +566,7 @@ class ScienceWorldFailureDetector:
             response = self.judge_llm.complete_text(
                 prompt,
                 label="rule_repair",
-                max_tokens=self.judge_max_tokens,
+                max_tokens=self.repair_max_tokens,
             )
             try:
                 payload = _parse_judge_json(response)
@@ -495,7 +580,12 @@ class ScienceWorldFailureDetector:
             strategy, repair_action, confidence, rationale = _parse_repair_advice(
                 payload,
                 confidence_threshold=self.repair_confidence_threshold,
-                valid_actions=valid_actions_after_action,
+                valid_actions=filtered_valid_actions,
+                current_action=action,
+                failure_type=failure_type,
+                observation=observation,
+                context=repair_context,
+                enable_intent_filter=self.enable_repair_intent_filter,
             )
             if not strategy or not repair_action or confidence is None:
                 logger.info(
@@ -516,10 +606,19 @@ class ScienceWorldFailureDetector:
                 repair_action=repair_action,
                 repair_confidence=confidence,
                 repair_rationale=rationale,
+                source=advice_source,
             )
         except Exception as e:
             logger.warning(f"Rule repair LLM call failed: {e}")
         return None
+
+    def generate_rule_repair_advice(
+        self,
+        **kwargs: Any,
+    ) -> RepairAdvice | None:
+        """Compatibility wrapper for rule failure repair advice."""
+        kwargs.setdefault("advice_source", "rule_repair_judge")
+        return self.generate_repair_advice(**kwargs)
 
     def is_task_complete(self, observation: str, done: bool, info: dict) -> tuple[bool, bool]:
         """Check if episode is over and whether it succeeded.
@@ -665,6 +764,54 @@ def _score_delta(
         return None
 
 
+def _score_delta_bucket(score_delta: float | None) -> str:
+    if score_delta is None:
+        return "unknown"
+    if score_delta > 0:
+        return "positive"
+    if score_delta < 0:
+        return "negative"
+    return "zero"
+
+
+def _judge_cache_key(
+    *,
+    task_type: str,
+    task_goal: str,
+    action: str,
+    observation: str,
+    score_delta: float | None,
+) -> tuple[str, str, str, str, str]:
+    compact_goal = _compact_text(task_goal or "", max_chars=180).lower()
+    return (
+        _normalize_action_text(task_type),
+        _normalize_action_text(action),
+        _compact_text(observation or "", max_chars=240).lower(),
+        _score_delta_bucket(score_delta),
+        compact_goal,
+    )
+
+
+def _clone_detection_result(result: DetectionResult) -> DetectionResult:
+    return DetectionResult(
+        is_failure=result.is_failure,
+        failure_type=result.failure_type,
+        reason=result.reason,
+        confidence=result.confidence,
+        detector_source=result.detector_source,
+        evidence_for_failure=list(result.evidence_for_failure or []),
+        evidence_against_failure=list(result.evidence_against_failure or []),
+        productive_signal=result.productive_signal,
+        judge_repair_strategy=result.judge_repair_strategy,
+        judge_repair_action=result.judge_repair_action,
+        judge_repair_confidence=result.judge_repair_confidence,
+        judge_repair_rationale=result.judge_repair_rationale,
+        judge_advice_source=result.judge_advice_source,
+        judge_cache_hit=result.judge_cache_hit,
+        judge_call_type=result.judge_call_type,
+    )
+
+
 def _strip_code_fences(response: str) -> str:
     text = response.strip()
     if text.startswith("```"):
@@ -683,10 +830,35 @@ def _extract_json_object_text(response: str) -> str:
 
 
 def _parse_judge_json(response: str) -> dict[str, Any]:
-    payload = json.loads(_extract_json_object_text(response))
+    payload = json.loads(_extract_json_object_text(response), strict=False)
     if not isinstance(payload, dict):
         raise ValueError("Judge response is not a JSON object")
     return payload
+
+
+def _regex_json_scalar(response: str, key: str) -> str | None:
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]*)"', response)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _parse_truncated_non_failure_judge(response: str) -> DetectionResult | None:
+    """Recover safe non-failure decisions from max-token-truncated judge JSON."""
+    is_failure_match = re.search(r'"is_failure"\s*:\s*(true|false)', response, re.IGNORECASE)
+    if not is_failure_match or is_failure_match.group(1).lower() != "false":
+        return None
+    confidence_match = re.search(r'"confidence"\s*:\s*([0-9]*\.?[0-9]+)', response)
+    confidence = _as_confidence(confidence_match.group(1)) if confidence_match else None
+    reason = _regex_json_scalar(response, "reason") or ""
+    productive_signal = _regex_json_scalar(response, "productive_signal") or "unknown"
+    return DetectionResult(
+        is_failure=False,
+        confidence=confidence,
+        reason=reason,
+        productive_signal=productive_signal,
+        judge_call_type="implicit_detector",
+    )
 
 
 def _as_bool(value: Any) -> bool | None:
@@ -724,6 +896,11 @@ def _parse_repair_advice(
     *,
     confidence_threshold: float,
     valid_actions: str | list[str] = "",
+    current_action: str = "",
+    failure_type: str = "",
+    observation: str = "",
+    context: str = "",
+    enable_intent_filter: bool = True,
 ) -> tuple[str, str, float | None, str]:
     strategy = str(payload.get("repair_strategy", "") or "").strip()
     action = str(payload.get("repair_action", "") or "").strip()
@@ -734,10 +911,34 @@ def _parse_repair_advice(
     if not strategy or not action:
         return "", "", confidence, rationale
     if _matches_available_action(action, valid_actions):
-        return strategy, action, confidence, rationale
+        if not enable_intent_filter:
+            return strategy, action, confidence, rationale
+        current_frame = parse_action_intent(current_action, context=context)
+        repair_frame = parse_action_intent(action, context=context)
+        if is_repair_compatible(
+            failure_type,
+            current_frame,
+            repair_frame,
+            observation=observation,
+            context=context,
+        ):
+            return strategy, action, confidence, rationale
+        return "", "", confidence, rationale
     if _has_available_actions(valid_actions):
         return "", "", confidence, rationale
     if not _looks_like_scienceworld_action(action):
+        return "", "", confidence, rationale
+    if not enable_intent_filter:
+        return strategy, action, confidence, rationale
+    current_frame = parse_action_intent(current_action, context=context)
+    repair_frame = parse_action_intent(action, context=context)
+    if not is_repair_compatible(
+        failure_type,
+        current_frame,
+        repair_frame,
+        observation=observation,
+        context=context,
+    ):
         return "", "", confidence, rationale
     return strategy, action, confidence, rationale
 

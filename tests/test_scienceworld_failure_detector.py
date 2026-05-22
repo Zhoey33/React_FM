@@ -76,7 +76,7 @@ def test_judge_is_not_called_when_implicit_failures_are_disabled():
     assert judge.prompts == []
 
 
-def test_enabled_judge_prompt_contains_context_and_parses_failure_json():
+def test_enabled_compact_judge_prompt_contains_context_and_parses_failure_json():
     judge = FakeJudgeLLM(
         '{"is_failure": true, "failure_type": "implicit_no_progress", '
         '"confidence": 0.82, "reason": "The action repeated prior exploration.", '
@@ -122,7 +122,7 @@ def test_enabled_judge_prompt_contains_context_and_parses_failure_json():
     call = judge.prompts[0]
     prompt = call["prompt"]
     assert call["label"] == "judge"
-    assert call["max_tokens"] == 512
+    assert call["max_tokens"] == 128
     assert "Task type: melt" in prompt
     assert "Variation index: 21" in prompt
     assert "Step: 2" in prompt
@@ -141,9 +141,12 @@ def test_enabled_judge_prompt_contains_context_and_parses_failure_json():
     assert "Inventory after action:" in prompt
     assert "Valid actions after action:" in prompt
     assert "open drawer -> examine drawer" in prompt
+    assert "repair_strategy" not in prompt
+    assert "repair_action" not in prompt
+    assert result.has_judge_repair_advice is False
 
 
-def test_judge_prompt_includes_ten_recent_history_items():
+def test_judge_prompt_includes_five_recent_history_items():
     judge = FakeJudgeLLM(
         '{"is_failure": false, "failure_type": "productive", '
         '"confidence": 0.2, "reason": "Recent exploration is productive.", '
@@ -167,8 +170,8 @@ def test_judge_prompt_includes_ten_recent_history_items():
     )
 
     prompt = judge.prompts[0]["prompt"]
-    assert "Step: 1\n" not in prompt
-    assert "Action: action 2" in prompt
+    assert "Action: action 6" not in prompt
+    assert "Action: action 7" in prompt
     assert "Action: action 11" in prompt
 
 
@@ -326,11 +329,7 @@ def test_high_confidence_judge_failure_with_evidence_is_accepted():
         '{"is_failure": true, "failure_type": "redundant_repeat", '
         '"confidence": 0.94, "reason": "The exact same command repeated with the same result.", '
         '"evidence_for_failure": ["same action repeated three times", "same observation"], '
-        '"evidence_against_failure": [], "productive_signal": "none", '
-        '"repair_strategy": "Stop repeating the failed command and inspect available options.", '
-        '"repair_action": "look around", '
-        '"repair_confidence": 0.86, '
-        '"repair_rationale": "The agent needs fresh state information before choosing another action."}'
+        '"evidence_against_failure": [], "productive_signal": "none"}'
     )
     detector = ScienceWorldFailureDetector(
         judge_llm=judge,
@@ -349,87 +348,82 @@ def test_high_confidence_judge_failure_with_evidence_is_accepted():
     assert result.is_failure is True
     assert result.failure_type == "redundant_repeat"
     assert result.detector_source == "judge"
-    assert result.judge_repair_strategy == "Stop repeating the failed command and inspect available options."
-    assert result.judge_repair_action == "look around"
-    assert result.judge_repair_confidence == 0.86
-    assert result.judge_repair_rationale == (
-        "The agent needs fresh state information before choosing another action."
-    )
-    assert result.has_judge_repair_advice is True
+    assert result.judge_repair_strategy == ""
+    assert result.judge_repair_action == ""
+    assert result.judge_repair_confidence is None
+    assert result.judge_repair_rationale == ""
+    assert result.has_judge_repair_advice is False
 
 
-def test_low_confidence_or_malformed_judge_repair_advice_is_not_injectable():
-    low_repair_confidence = ScienceWorldFailureDetector(
+def test_compact_judge_ignores_repair_fields_in_detection_response():
+    detector = ScienceWorldFailureDetector(
         judge_llm=FakeJudgeLLM(
             '{"is_failure": true, "failure_type": "implicit_no_progress", '
             '"confidence": 0.94, "reason": "The action did not move toward the task.", '
             '"evidence_for_failure": ["same state"], '
             '"evidence_against_failure": [], "productive_signal": "none", '
-            '"repair_strategy": "Try a different action.", '
+            '"repair_strategy": "This legacy field should be ignored.", '
             '"repair_action": "inventory", '
-            '"repair_confidence": 0.3, '
-            '"repair_rationale": "Weak guess."}'
-        ),
-        enable_implicit_failures=True,
-        implicit_failure_confidence_threshold=0.8,
-        repair_confidence_threshold=0.7,
-    )
-    missing_action = ScienceWorldFailureDetector(
-        judge_llm=FakeJudgeLLM(
-            '{"is_failure": true, "failure_type": "implicit_no_progress", '
-            '"confidence": 0.94, "reason": "The action did not move toward the task.", '
-            '"evidence_for_failure": ["same state"], '
-            '"evidence_against_failure": [], "productive_signal": "none", '
-            '"repair_strategy": "Try a different action.", '
-            '"repair_action": "", '
             '"repair_confidence": 0.9, '
-            '"repair_rationale": "Missing concrete action."}'
-        ),
-        enable_implicit_failures=True,
-        implicit_failure_confidence_threshold=0.8,
-        repair_confidence_threshold=0.7,
-    )
-    invalid_action = ScienceWorldFailureDetector(
-        judge_llm=FakeJudgeLLM(
-            '{"is_failure": true, "failure_type": "implicit_no_progress", '
-            '"confidence": 0.94, "reason": "The action did not move toward the task.", '
-            '"evidence_for_failure": ["same state"], '
-            '"evidence_against_failure": [], "productive_signal": "none", '
-            '"repair_strategy": "Try a different action.", '
-            '"repair_action": "You should inspect inventory first.", '
-            '"repair_confidence": 0.9, '
-            '"repair_rationale": "Not a valid ScienceWorld command."}'
-        ),
-        enable_implicit_failures=True,
-        implicit_failure_confidence_threshold=0.8,
-        repair_confidence_threshold=0.7,
-    )
-    chained_action = ScienceWorldFailureDetector(
-        judge_llm=FakeJudgeLLM(
-            '{"is_failure": true, "failure_type": "implicit_no_progress", '
-            '"confidence": 0.94, "reason": "The action did not move toward the task.", '
-            '"evidence_for_failure": ["same state"], '
-            '"evidence_against_failure": [], "productive_signal": "none", '
-            '"repair_strategy": "Open the door before moving.", '
-            '"repair_action": "open door to kitchen -> go to kitchen", '
-            '"repair_confidence": 0.9, '
-            '"repair_rationale": "This is a multi-action chain, not one next action."}'
+            '"repair_rationale": "This legacy field should be ignored."}'
         ),
         enable_implicit_failures=True,
         implicit_failure_confidence_threshold=0.8,
         repair_confidence_threshold=0.7,
     )
 
-    for detector in (low_repair_confidence, missing_action, invalid_action, chained_action):
-        result = detector.detect(
-            observation="The room looks unchanged.",
-            action="look around",
-            action_history=["inventory", "look around"],
-            score_before_action=5,
-            score_after_action=5,
-        )
-        assert result.is_failure is True
-        assert result.has_judge_repair_advice is False
+    result = detector.detect(
+        observation="The room looks unchanged.",
+        action="look around",
+        action_history=["inventory", "look around"],
+        score_before_action=5,
+        score_after_action=5,
+    )
+
+    assert result.is_failure is True
+    assert result.has_judge_repair_advice is False
+    assert result.judge_advice_source == ""
+
+
+def test_judge_cache_reuses_same_compact_decision_without_second_llm_call():
+    judge = FakeJudgeLLM(
+        '{"is_failure": true, "failure_type": "implicit_no_progress", '
+        '"confidence": 0.91, "reason": "The same state repeated.", '
+        '"evidence_for_failure": ["same observation"], '
+        '"evidence_against_failure": [], "productive_signal": "none"}'
+    )
+    detector = ScienceWorldFailureDetector(
+        judge_llm=judge,
+        enable_implicit_failures=True,
+        enable_cache=True,
+    )
+
+    first = detector.detect(
+        observation="The room looks unchanged.",
+        action="look around",
+        action_history=["look around"],
+        task_type="melt",
+        task_goal="Your task is to melt tin.",
+        score_before_action=5,
+        score_after_action=5,
+    )
+    second = detector.detect(
+        observation="The room looks unchanged.",
+        action="look around",
+        action_history=["look around"],
+        task_type="melt",
+        task_goal="Your task is to melt tin.",
+        score_before_action=5,
+        score_after_action=5,
+    )
+
+    assert first.is_failure is True
+    assert first.judge_cache_hit is False
+    assert first.judge_call_type == "implicit_detector"
+    assert second.is_failure is True
+    assert second.judge_cache_hit is True
+    assert second.judge_call_type == "cache"
+    assert len(judge.prompts) == 1
 
 
 def test_generate_rule_repair_advice_parses_valid_json():
@@ -469,7 +463,7 @@ def test_generate_rule_repair_advice_parses_valid_json():
 
     call = judge.prompts[0]
     assert call["label"] == "rule_repair"
-    assert call["max_tokens"] == 512
+    assert call["max_tokens"] == 192
     prompt = call["prompt"]
     assert "Failure type: precondition_blocked" in prompt
     assert "Failed action: go to hallway" in prompt
@@ -534,6 +528,67 @@ def test_generate_rule_repair_advice_requires_valid_action_when_available():
     assert advice is None
 
 
+def test_generate_rule_repair_advice_rejects_semantically_invalid_connect_action():
+    detector = ScienceWorldFailureDetector(
+        judge_llm=FakeJudgeLLM(
+            '{"repair_strategy": "Use a valid navigation action.", '
+            '"repair_action": "connect agent to kitchen", '
+            '"repair_confidence": 0.9, '
+            '"repair_rationale": "The action appears in the valid action list."}'
+        ),
+        repair_confidence_threshold=0.7,
+    )
+
+    advice = detector.generate_rule_repair_advice(
+        action="go to kitchen",
+        observation="No known action matches that input.",
+        failure_type="syntax_or_parse",
+        failure_reason="Action not recognized",
+        task_goal="Your task is to melt tin.",
+        look_after_action="You are in a hallway. There is a kitchen door.",
+        valid_actions_after_action=[
+            "connect agent to kitchen",
+            "go to kitchen",
+            "open door to kitchen",
+        ],
+    )
+
+    assert advice is None
+    prompt = detector.judge_llm.prompts[0]["prompt"]
+    assert "connect agent to kitchen" not in prompt
+    assert "go to kitchen" in prompt
+    assert "open door to kitchen" in prompt
+
+
+def test_generate_rule_repair_advice_accepts_connect_action_in_circuit_context():
+    detector = ScienceWorldFailureDetector(
+        judge_llm=FakeJudgeLLM(
+            '{"repair_strategy": "Connect the circuit parts.", '
+            '"repair_action": "connect red wire to battery", '
+            '"repair_confidence": 0.9, '
+            '"repair_rationale": "The task context is electrical."}'
+        ),
+        repair_confidence_threshold=0.7,
+    )
+
+    advice = detector.generate_rule_repair_advice(
+        action="connect wire",
+        observation="No known action matches that input.",
+        failure_type="syntax_or_parse",
+        failure_reason="Action not recognized",
+        task_goal="Your task is to complete the electrical circuit.",
+        look_after_action="You see a red wire, a black wire, and a battery terminal.",
+        valid_actions_after_action=[
+            "connect red wire to battery",
+            "connect black wire to battery",
+            "look around",
+        ],
+    )
+
+    assert advice is not None
+    assert advice.repair_action == "connect red wire to battery"
+
+
 def test_generate_rule_repair_advice_accepts_numeric_ambiguity_choice_when_valid():
     detector = ScienceWorldFailureDetector(
         judge_llm=FakeJudgeLLM(
@@ -573,6 +628,29 @@ def test_generate_rule_repair_advice_malformed_json_or_exception_returns_none():
         assert advice is None
 
 
+def test_generate_rule_repair_advice_accepts_llm_json_with_raw_newline_in_string():
+    detector = ScienceWorldFailureDetector(
+        judge_llm=FakeJudgeLLM(
+            '{"repair_strategy": "Open the blocked door.", '
+            '"repair_action": "open door", '
+            '"repair_confidence": 0.91, '
+            '"repair_rationale": "The door is closed.\nOpening it satisfies the precondition."}'
+        ),
+        repair_confidence_threshold=0.7,
+    )
+
+    advice = detector.generate_rule_repair_advice(
+        action="go to kitchen",
+        observation="The door is not open.",
+        failure_type="precondition_blocked",
+        failure_reason="door closed",
+    )
+
+    assert advice is not None
+    assert advice.repair_action == "open door"
+    assert "Opening it satisfies" in advice.repair_rationale
+
+
 def test_judge_malformed_json_or_exception_safely_returns_non_failure():
     malformed = ScienceWorldFailureDetector(
         judge_llm=FakeJudgeLLM("not json"),
@@ -593,3 +671,31 @@ def test_judge_malformed_json_or_exception_safely_returns_non_failure():
         )
         assert result.is_failure is False
         assert result.failure_type == ""
+
+
+def test_truncated_non_failure_judge_json_uses_conservative_fallback(caplog):
+    truncated = (
+        '{ "is_failure": false, "failure_type": "productive", '
+        '"confidence": 0.95, '
+        '"reason": "Examining the open cupboard confirms contents.", '
+        '"evidence_for_failure": [], '
+        '"evidence_against_failure": ["Cupboard was already open, but examining it confirms '
+    )
+    detector = ScienceWorldFailureDetector(
+        judge_llm=FakeJudgeLLM(truncated),
+        enable_implicit_failures=True,
+    )
+
+    result = detector.detect(
+        observation="a cupboard. The cupboard door is open.",
+        action="examine cupboard",
+        action_history=["open cupboard", "examine cupboard"],
+        score_before_action=0,
+        score_after_action=0,
+    )
+
+    assert result.is_failure is False
+    assert result.confidence == 0.95
+    assert result.reason == "Examining the open cupboard confirms contents."
+    assert result.productive_signal == "unknown"
+    assert "Judge JSON parse failed" not in caplog.text

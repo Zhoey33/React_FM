@@ -6,6 +6,12 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from src.scienceworld_action_intent import (
+    are_failure_intents_compatible,
+    is_repair_compatible,
+    parse_action_intent,
+)
+
 
 _COMPATIBLE_FAILURE_TYPES: dict[str, set[str]] = {
     "precondition_blocked": {"precondition_blocked", "ambiguity", "syntax_or_parse"},
@@ -58,6 +64,9 @@ class RetrievalGateDecision:
     rejection_reason: str = ""
     filtered_by_type_count: int = 0
     filtered_by_safety_count: int = 0
+    filtered_by_intent_count: int = 0
+    current_intent: str = ""
+    candidate_intents: list[str] | None = None
 
 
 def _normalize_action(action: str) -> str:
@@ -137,6 +146,85 @@ def _safety_rejection(
     return ""
 
 
+def _candidate_repair_frames(entry: Any, *, context: str) -> list[Any]:
+    repair_action = str(
+        getattr(entry, "repair_action", "") or getattr(entry, "solution_action", "")
+    )
+    return [
+        parse_action_intent(action, context=context)
+        for action in _split_repair_actions(repair_action)
+    ]
+
+
+def _entry_intent_context(entry: Any, extra_context: str = "") -> str:
+    return " ".join(
+        [
+            str(extra_context or ""),
+            str(getattr(entry, "failure_action", "") or ""),
+            str(getattr(entry, "failure_observation", "") or ""),
+            str(getattr(entry, "repair_action", "") or ""),
+            str(getattr(entry, "solution_action", "") or ""),
+        ]
+    )
+
+
+def _candidate_intent_label(entry: Any, *, context: str) -> str:
+    entry_context = _entry_intent_context(entry, context)
+    frames = _candidate_repair_frames(entry, context=entry_context)
+    for frame in frames:
+        if frame.intent not in {"unknown", "examine_info", "wait"}:
+            return frame.intent
+    failure_frame = parse_action_intent(
+        str(getattr(entry, "failure_action", "") or ""),
+        entry_context,
+    )
+    return failure_frame.intent
+
+
+def _intent_rejection(
+    entry: Any,
+    *,
+    current_failure_type: str,
+    failed_action: str,
+    failure_observation: str,
+) -> str:
+    context = " ".join(
+        [
+            str(current_failure_type or ""),
+            str(failed_action or ""),
+            str(failure_observation or ""),
+            str(getattr(entry, "failure_action", "") or ""),
+            str(getattr(entry, "failure_observation", "") or ""),
+            str(getattr(entry, "repair_action", "") or ""),
+            str(getattr(entry, "solution_action", "") or ""),
+        ]
+    )
+    current_frame = parse_action_intent(failed_action, context=context)
+    memory_frame = parse_action_intent(str(getattr(entry, "failure_action", "") or ""), context)
+    failure_intents_compatible = are_failure_intents_compatible(
+        current_frame,
+        memory_frame,
+        current_failure_type=current_failure_type,
+        observation=failure_observation,
+    )
+
+    repair_frames = _candidate_repair_frames(entry, context=context)
+    if any(
+        is_repair_compatible(
+            current_failure_type,
+            current_frame,
+            repair_frame,
+            observation=failure_observation,
+            context=context,
+        )
+        for repair_frame in repair_frames
+    ):
+        return ""
+    if failure_intents_compatible and repair_frames:
+        return "repair_intent_incompatible"
+    return "intent_incompatible"
+
+
 def _relevance_score(
     entry: Any,
     *,
@@ -184,15 +272,23 @@ def select_retrieval_memory(
     relevance_score_threshold: float = 0.45,
     enable_failure_type_filter: bool = True,
     enable_safety_gate: bool = True,
+    enable_intent_gate: bool = True,
 ) -> RetrievalGateDecision:
     """Select one memory for injection using deterministic relevance checks."""
     candidate_ids = [int(getattr(entry, "memory_id", -1)) for entry in entries]
     candidate_scores = [float(score) for score in retrieval_scores]
     relevance_scores = [0.0 for _ in entries]
+    current_intent = parse_action_intent(
+        failed_action,
+        context=" ".join([str(current_failure_type or ""), str(failure_observation or "")]),
+    ).intent
+    candidate_intents = [_candidate_intent_label(entry, context=failure_observation) for entry in entries]
 
     filtered_by_type = 0
     filtered_by_safety = 0
+    filtered_by_intent = 0
     safety_rejection = ""
+    intent_rejection = ""
     scored: list[tuple[float, int, Any]] = []
 
     for index, entry in enumerate(entries):
@@ -200,6 +296,18 @@ def select_retrieval_memory(
         if enable_failure_type_filter and not _is_type_compatible(current_failure_type, memory_type):
             filtered_by_type += 1
             continue
+
+        if enable_intent_gate:
+            rejection = _intent_rejection(
+                entry,
+                current_failure_type=current_failure_type,
+                failed_action=failed_action,
+                failure_observation=failure_observation,
+            )
+            if rejection:
+                filtered_by_intent += 1
+                intent_rejection = intent_rejection or rejection
+                continue
 
         if enable_safety_gate:
             rejection = _safety_rejection(
@@ -226,7 +334,9 @@ def select_retrieval_memory(
     if not scored:
         if entries and filtered_by_type == len(entries):
             reason = "no_type_compatible_candidates"
-        elif entries and filtered_by_safety == len(entries) - filtered_by_type:
+        elif entries and filtered_by_intent == len(entries) - filtered_by_type:
+            reason = intent_rejection or "intent_incompatible"
+        elif entries and filtered_by_safety == len(entries) - filtered_by_type - filtered_by_intent:
             reason = safety_rejection or "no_safety_compatible_candidates"
         else:
             reason = "no_candidates"
@@ -238,6 +348,9 @@ def select_retrieval_memory(
             rejection_reason=reason,
             filtered_by_type_count=filtered_by_type,
             filtered_by_safety_count=filtered_by_safety,
+            filtered_by_intent_count=filtered_by_intent,
+            current_intent=current_intent,
+            candidate_intents=candidate_intents,
         )
 
     scored.sort(
@@ -257,6 +370,9 @@ def select_retrieval_memory(
             rejection_reason="below_relevance_threshold",
             filtered_by_type_count=filtered_by_type,
             filtered_by_safety_count=filtered_by_safety,
+            filtered_by_intent_count=filtered_by_intent,
+            current_intent=current_intent,
+            candidate_intents=candidate_intents,
         )
 
     return RetrievalGateDecision(
@@ -268,4 +384,7 @@ def select_retrieval_memory(
         relevance_decision=True,
         filtered_by_type_count=filtered_by_type,
         filtered_by_safety_count=filtered_by_safety,
+        filtered_by_intent_count=filtered_by_intent,
+        current_intent=current_intent,
+        candidate_intents=candidate_intents,
     )

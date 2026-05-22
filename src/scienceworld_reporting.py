@@ -99,6 +99,32 @@ def compute_summary(
     extras = extra_tokens or {}
     agent_tokens = sum(int(r.get("agent_tokens", r.get("total_tokens", 0))) for r in results)
     judge_tokens = sum(int(r.get("judge_tokens", 0)) for r in results) + int(extras.get("judge_tokens", 0))
+    judge_detector_tokens = sum(int(r.get("judge_detector_tokens", 0)) for r in results) + int(
+        extras.get("judge_detector_tokens", 0)
+    )
+    judge_repair_tokens = sum(int(r.get("judge_repair_tokens", 0)) for r in results) + int(
+        extras.get("judge_repair_tokens", 0)
+    )
+    judge_calls = sum(int(r.get("judge_calls", 0)) for r in results) + int(
+        extras.get("judge_calls", 0)
+    )
+    judge_cache_hits = sum(int(r.get("judge_cache_hits", 0)) for r in results) + int(
+        extras.get("judge_cache_hits", 0)
+    )
+    if not judge_calls or not judge_cache_hits:
+        step_judge_calls = 0
+        step_cache_hits = 0
+        for result in results:
+            for step in result.get("steps", []):
+                call_type = step.get("judge_call_type", "")
+                if call_type in {"implicit_detector", "repair_advice"}:
+                    step_judge_calls += 1
+                if step.get("judge_cache_hit") or call_type == "cache":
+                    step_cache_hits += 1
+        if not judge_calls:
+            judge_calls = step_judge_calls
+        if not judge_cache_hits:
+            judge_cache_hits = step_cache_hits
     extractor_tokens = sum(int(r.get("extractor_tokens", 0)) for r in results) + int(
         extras.get("extractor_tokens", 0)
     )
@@ -127,6 +153,10 @@ def compute_summary(
         "total_tokens": total_tokens,
         "agent_tokens": agent_tokens,
         "judge_tokens": judge_tokens,
+        "judge_detector_tokens": judge_detector_tokens,
+        "judge_repair_tokens": judge_repair_tokens,
+        "judge_calls": judge_calls,
+        "judge_cache_hits": judge_cache_hits,
         "extractor_tokens": extractor_tokens,
         "reflection_tokens": reflection_tokens,
         "avg_tokens_per_episode": round(total_tokens / total) if total else 0,

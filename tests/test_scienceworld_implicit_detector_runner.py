@@ -57,8 +57,20 @@ class FakeExtractorLLM:
 class FakeDetector:
     judge_llm = None
 
-    def __init__(self):
+    def __init__(self, advice=None):
         self.calls = []
+        self.repair_calls = []
+        self.reset_cache_calls = 0
+        self.advice = advice or RepairAdvice(
+            repair_strategy="Check inventory instead of repeating exploration.",
+            repair_action="inventory",
+            repair_confidence=0.88,
+            repair_rationale="Inventory may reveal tools that should guide the next step.",
+            source="implicit_judge_repair",
+        )
+
+    def reset_judge_cache(self):
+        self.reset_cache_calls += 1
 
     def detect(self, observation, action, action_history, **kwargs):
         self.calls.append(
@@ -79,11 +91,13 @@ class FakeDetector:
         result.productive_signal = "none"
         result.evidence_for_failure = ["No new information."]
         result.evidence_against_failure = []
-        result.judge_repair_strategy = "Inspect inventory before repeating exploration."
-        result.judge_repair_action = "inventory"
-        result.judge_repair_confidence = 0.88
-        result.judge_repair_rationale = "Inventory may reveal tools that should guide the next step."
+        result.judge_cache_hit = False
+        result.judge_call_type = "implicit_detector"
         return result
+
+    def generate_repair_advice(self, **kwargs):
+        self.repair_calls.append(kwargs)
+        return self.advice
 
 
 class FakeRuleDetector:
@@ -92,6 +106,7 @@ class FakeRuleDetector:
     def __init__(self, advice=None, failure_limit=None):
         self.calls = []
         self.repair_calls = []
+        self.reset_cache_calls = 0
         self.failure_limit = failure_limit
         self.advice = advice or RepairAdvice(
             repair_strategy="Open the blocked door before retrying movement.",
@@ -100,6 +115,9 @@ class FakeRuleDetector:
             repair_rationale="The observation says the door is not open.",
             source="rule_repair_judge",
         )
+
+    def reset_judge_cache(self):
+        self.reset_cache_calls += 1
 
     def detect(self, observation, action, action_history, **kwargs):
         self.calls.append(
@@ -120,6 +138,10 @@ class FakeRuleDetector:
         )
 
     def generate_rule_repair_advice(self, **kwargs):
+        self.repair_calls.append(kwargs)
+        return self.advice
+
+    def generate_repair_advice(self, **kwargs):
         self.repair_calls.append(kwargs)
         return self.advice
 
@@ -279,11 +301,14 @@ def test_judge_detected_failure_triggers_retrieval_and_enters_extraction(monkeyp
     assert step["failure_confidence"] == 0.9
     assert step["productive_signal"] == "none"
     assert step["evidence_for_failure"] == ["No new information."]
-    assert step["judge_repair_strategy"] == "Inspect inventory before repeating exploration."
-    assert step["judge_repair_action"] == "inventory"
-    assert step["judge_repair_confidence"] == 0.88
-    assert step["judge_repair_rationale"] == "Inventory may reveal tools that should guide the next step."
+    assert step["judge_repair_strategy"] == ""
+    assert step["judge_repair_action"] == ""
+    assert step["judge_repair_confidence"] is None
+    assert step["judge_repair_rationale"] == ""
+    assert step["judge_cache_hit"] is False
+    assert step["judge_call_type"] == "implicit_detector"
     assert step["judge_advice_injected"] is False
+    assert detector.reset_cache_calls == 1
 
     assert memory.retrieve_calls
     assert memory.retrieve_calls[0]["return_scores"] is True
@@ -460,6 +485,7 @@ def test_retrieved_memory_takes_priority_over_judge_advice():
     assert step["memory_injected"] is True
     assert step["retrieved_memory_ids"] == [31]
     assert step["judge_advice_injected"] is False
+    assert detector.repair_calls == []
     assert "Retrieved repair memory:" in llm.prompts[1]
 
 
@@ -602,6 +628,38 @@ def test_rule_repair_advice_scheduled_on_last_step_is_not_marked_injected():
     assert detector.repair_calls
     assert step["judge_advice_source"] == "rule_repair_judge"
     assert step["judge_advice_injected"] is False
+
+
+def test_judge_failure_retrieval_miss_calls_repair_only_advice_once():
+    llm = _PromptRecordingLLM()
+    detector = FakeDetector()
+    memory = FakeMemory()
+    agent = run_scienceworld.ScienceWorldReActAgent(
+        llm=llm,
+        memory_store=memory,
+        failure_detector=detector,
+        extractor_llm=None,
+        max_steps=2,
+        max_memory_inject=1,
+        enable_memory=True,
+        inject_mode="in_loop",
+    )
+
+    result = agent.run_episode(FakeEnv(), env_idx=7)
+
+    assert detector.repair_calls
+    repair_call = detector.repair_calls[0]
+    assert repair_call["failure_type"] == "implicit_no_progress"
+    assert repair_call["advice_source"] == "implicit_judge_repair"
+    assert "Unverified immediate judge suggestion:" in llm.prompts[1]
+    assert "Suggested next action: inventory" in llm.prompts[1]
+    first_step = result["steps"][0]
+    assert first_step["judge_repair_strategy"] == "Check inventory instead of repeating exploration."
+    assert first_step["judge_repair_action"] == "inventory"
+    assert first_step["judge_repair_confidence"] == 0.88
+    assert first_step["judge_repair_rationale"] == "Inventory may reveal tools that should guide the next step."
+    assert first_step["judge_advice_source"] == "implicit_judge_repair"
+    assert first_step["judge_advice_injected"] is True
 
 
 def test_memory_scope_metadata_uses_loaded_store_scope():

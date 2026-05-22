@@ -67,6 +67,8 @@ def build_failure_events(episode: dict[str, Any], *, memory_mode: str) -> list[d
                 "judge_repair_rationale": step.get("judge_repair_rationale", ""),
                 "judge_advice_source": step.get("judge_advice_source", ""),
                 "judge_advice_injected": bool(step.get("judge_advice_injected", False)),
+                "judge_cache_hit": bool(step.get("judge_cache_hit", False)),
+                "judge_call_type": step.get("judge_call_type", ""),
                 "failed_action": step.get("action", ""),
                 "failure_observation": step.get("observation", ""),
                 "memory_mode": memory_mode,
@@ -95,6 +97,11 @@ def build_failure_events(episode: dict[str, Any], *, memory_mode: str) -> list[d
                 "retrieval_filtered_by_safety_count": step.get(
                     "retrieval_filtered_by_safety_count", 0
                 ),
+                "retrieval_filtered_by_intent_count": step.get(
+                    "retrieval_filtered_by_intent_count", 0
+                ),
+                "retrieval_current_intent": step.get("retrieval_current_intent", ""),
+                "retrieval_candidate_intents": step.get("retrieval_candidate_intents", []),
                 "injected_memory_text": step.get("injected_memory_text", ""),
                 "next_action": steps[index + 1].get("action", "") if index + 1 < len(steps) else "",
                 "score_before_failure": score_before,

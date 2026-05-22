@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.llm import LLMClient
 from src.memory import FailureMemoryStore, RetrievalResult
 from src.scienceworld_retrieval_gate import select_retrieval_memory
-from src.scienceworld_failure_detector import ScienceWorldFailureDetector
+from src.scienceworld_failure_detector import RepairAdvice, ScienceWorldFailureDetector
 from src.scienceworld_env import ScienceWorldEnv, DEFAULT_EVAL_TASKS
 from src.scienceworld_failure_events import write_failure_events_jsonl
 from src.scienceworld_reporting import build_protocol_metadata
@@ -275,6 +275,7 @@ class ScienceWorldReActAgent:
         relevance_score_threshold: float = 0.45,
         enable_relevance_judge: bool = False,
         enable_rule_repair_advice: bool = True,
+        enable_intent_gate: bool = True,
     ):
         self.llm = llm
         self.memory = memory_store
@@ -294,6 +295,7 @@ class ScienceWorldReActAgent:
         self.relevance_score_threshold = relevance_score_threshold
         self.enable_relevance_judge = enable_relevance_judge
         self.enable_rule_repair_advice = enable_rule_repair_advice
+        self.enable_intent_gate = enable_intent_gate
 
     def _prompt_history(self, history: list[tuple[str, str]]) -> list[tuple[str, str]]:
         """Return the recent history slice used in ScienceWorld prompts."""
@@ -315,6 +317,8 @@ class ScienceWorldReActAgent:
         self.llm.tracker.reset()
         if self.detector is not None and self.detector.judge_llm is not None:
             self.detector.judge_llm.tracker.reset()
+        if self.detector is not None and hasattr(self.detector, "reset_judge_cache"):
+            self.detector.reset_judge_cache()
         if self.extractor_llm is not None:
             self.extractor_llm.tracker.reset()
 
@@ -478,6 +482,9 @@ class ScienceWorldReActAgent:
                 "retrieval_rejection_reason": "",
                 "retrieval_filtered_by_type_count": 0,
                 "retrieval_filtered_by_safety_count": 0,
+                "retrieval_filtered_by_intent_count": 0,
+                "retrieval_current_intent": "",
+                "retrieval_candidate_intents": [],
                 "retrieved_memory_ids": [],
                 "retrieved_memory_scores": [],
                 "injected_memory_text": "",
@@ -495,6 +502,8 @@ class ScienceWorldReActAgent:
                 "judge_repair_rationale": "",
                 "judge_advice_source": "",
                 "judge_advice_injected": False,
+                "judge_cache_hit": False,
+                "judge_call_type": "",
             }
 
             if (
@@ -521,6 +530,8 @@ class ScienceWorldReActAgent:
                     inventory_after_action=inventory_after_action,
                     valid_actions_after_action=valid_actions_after_action,
                 )
+                record["judge_cache_hit"] = bool(getattr(det, "judge_cache_hit", False))
+                record["judge_call_type"] = getattr(det, "judge_call_type", "") or ""
                 if det.is_failure:
                     record["failure_detected"] = True
                     record["failure_type"] = det.failure_type
@@ -572,6 +583,7 @@ class ScienceWorldReActAgent:
                             relevance_score_threshold=self.relevance_score_threshold,
                             enable_failure_type_filter=self.enable_failure_type_filter,
                             enable_safety_gate=self.enable_safety_gate,
+                            enable_intent_gate=self.enable_intent_gate,
                         )
                         retrieved = [decision.selected_entry] if decision.selected_entry else []
                         selected_scores = []
@@ -594,16 +606,25 @@ class ScienceWorldReActAgent:
                         record["retrieval_filtered_by_safety_count"] = (
                             decision.filtered_by_safety_count
                         )
+                        record["retrieval_filtered_by_intent_count"] = (
+                            decision.filtered_by_intent_count
+                        )
+                        record["retrieval_current_intent"] = decision.current_intent
+                        record["retrieval_candidate_intents"] = (
+                            decision.candidate_intents or []
+                        )
                         record["retrieved_memory_scores"] = selected_scores
                         record["retrieved_memory_ids"] = [
                             entry.memory_id for entry in retrieved
                         ]
                         logger.info(
                             "    Retrieval candidates ids=%s scores=%s relevance=%s "
-                            "selected=%s reason=%s",
+                            "intents=%s current_intent=%s selected=%s reason=%s",
                             decision.candidate_memory_ids,
                             decision.candidate_scores,
                             decision.relevance_scores,
+                            decision.candidate_intents,
+                            decision.current_intent,
                             decision.selected_memory_id,
                             decision.rejection_reason,
                         )
@@ -624,52 +645,61 @@ class ScienceWorldReActAgent:
                                     _format_memory_for_log(entry),
                                 )
                             pending_memory_record = record
-                        elif det.detector_source == "judge" and det.has_judge_repair_advice:
-                            current_failure_context = {
-                                "action": action,
-                                "observation": observation,
-                                "failure_type": det.failure_type,
-                                "detector_source": det.detector_source,
-                                "failure_reason": det.reason,
-                            }
-                            current_judge_advice = {
-                                "repair_strategy": det.judge_repair_strategy,
-                                "repair_action": det.judge_repair_action,
-                                "repair_confidence": det.judge_repair_confidence,
-                                "repair_rationale": det.judge_repair_rationale,
-                            }
-                            record["judge_advice_source"] = det.judge_advice_source or "implicit_judge"
-                            pending_judge_advice_record = record
-                            logger.info(
-                                "    Scheduling judge advice fallback: strategy=%s action=%s "
-                                "confidence=%s rationale=%s",
-                                _compact_log_text(det.judge_repair_strategy, 160),
-                                _compact_log_text(det.judge_repair_action, 120),
-                                det.judge_repair_confidence,
-                                _compact_log_text(det.judge_repair_rationale, 180),
-                            )
                         elif (
                             self.enable_rule_repair_advice
-                            and det.detector_source == "rule"
-                            and hasattr(self.detector, "generate_rule_repair_advice")
-                        ):
-                            advice = self.detector.generate_rule_repair_advice(
-                                action=action,
-                                observation=observation,
-                                failure_type=det.failure_type,
-                                failure_reason=det.reason,
-                                task_type=task_type,
-                                task_goal=task_goal,
-                                recent_history=detector_history[-10:],
-                                score_before_action=score_before_action,
-                                score_after_action=final_score,
-                                step=step_num,
-                                variation_idx=variation_idx,
-                                look_after_action=look_after_action,
-                                inventory_after_action=inventory_after_action,
-                                valid_actions_after_action=valid_actions_after_action,
+                            and det.detector_source in ("judge", "rule")
+                            and (
+                                det.detector_source != "judge"
+                                or step_num < self.max_steps - 1
                             )
+                        ):
+                            advice_source = (
+                                "implicit_judge_repair"
+                                if det.detector_source == "judge"
+                                else "rule_repair_judge"
+                            )
+                            generator = getattr(self.detector, "generate_repair_advice", None)
+                            if generator is None and det.detector_source == "rule":
+                                generator = getattr(
+                                    self.detector,
+                                    "generate_rule_repair_advice",
+                                    None,
+                                )
+                            advice = None
+                            if generator is not None:
+                                advice = generator(
+                                    action=action,
+                                    observation=observation,
+                                    failure_type=det.failure_type,
+                                    failure_reason=det.reason,
+                                    advice_source=advice_source,
+                                    task_type=task_type,
+                                    task_goal=task_goal,
+                                    recent_history=detector_history[-10:],
+                                    score_before_action=score_before_action,
+                                    score_after_action=final_score,
+                                    step=step_num,
+                                    variation_idx=variation_idx,
+                                    look_after_action=look_after_action,
+                                    inventory_after_action=inventory_after_action,
+                                    valid_actions_after_action=valid_actions_after_action,
+                                )
+                            elif (
+                                det.detector_source == "judge"
+                                and det.has_judge_repair_advice
+                            ):
+                                # Compatibility for older test doubles/results; the compact
+                                # detector itself no longer produces repair advice inline.
+                                advice = RepairAdvice(
+                                    repair_strategy=det.judge_repair_strategy,
+                                    repair_action=det.judge_repair_action,
+                                    repair_confidence=det.judge_repair_confidence or 0.0,
+                                    repair_rationale=det.judge_repair_rationale,
+                                    source=det.judge_advice_source or advice_source,
+                                )
                             if advice is not None:
+                                if not record["judge_call_type"]:
+                                    record["judge_call_type"] = "repair_advice"
                                 current_failure_context = {
                                     "action": action,
                                     "observation": observation,
@@ -690,8 +720,9 @@ class ScienceWorldReActAgent:
                                 record["judge_advice_source"] = advice.source
                                 pending_judge_advice_record = record
                                 logger.info(
-                                    "    Scheduling rule repair advice fallback: "
-                                    "strategy=%s action=%s confidence=%s rationale=%s",
+                                    "    Scheduling %s advice fallback: strategy=%s action=%s "
+                                    "confidence=%s rationale=%s",
+                                    "judge" if det.detector_source == "judge" else "rule repair",
                                     _compact_log_text(advice.repair_strategy, 160),
                                     _compact_log_text(advice.repair_action, 120),
                                     advice.repair_confidence,
@@ -767,8 +798,26 @@ class ScienceWorldReActAgent:
         wall_time = time.time() - t0
         agent_stats = self.llm.tracker.summary()
         judge_tokens = 0
+        judge_detector_tokens = 0
+        judge_repair_tokens = 0
+        judge_calls = 0
         if self.detector is not None and self.detector.judge_llm is not None:
-            judge_tokens = self.detector.judge_llm.tracker.summary()["total_tokens"]
+            judge_tracker = self.detector.judge_llm.tracker
+            judge_tokens = judge_tracker.summary()["total_tokens"]
+            for call in getattr(judge_tracker, "call_log", []):
+                call_tokens = int(call.get("input_tokens", 0)) + int(
+                    call.get("output_tokens", 0)
+                )
+                label = call.get("label", "")
+                if label == "judge":
+                    judge_detector_tokens += call_tokens
+                    judge_calls += 1
+                elif label in {"rule_repair", "repair_advice"}:
+                    judge_repair_tokens += call_tokens
+                    judge_calls += 1
+            if judge_tokens and not getattr(judge_tracker, "call_log", []):
+                judge_detector_tokens = judge_tokens
+                judge_calls = judge_tracker.summary().get("total_calls", 0)
         extractor_tokens = 0
         if self.extractor_llm is not None:
             extractor_tokens = self.extractor_llm.tracker.summary()["total_tokens"]
@@ -785,6 +834,12 @@ class ScienceWorldReActAgent:
             "total_tokens": total_tokens,
             "agent_tokens": agent_stats["total_tokens"],
             "judge_tokens": judge_tokens,
+            "judge_detector_tokens": judge_detector_tokens,
+            "judge_repair_tokens": judge_repair_tokens,
+            "judge_calls": judge_calls,
+            "judge_cache_hits": sum(
+                1 for step in steps if step.get("judge_cache_hit")
+            ),
             "extractor_tokens": extractor_tokens,
             "failures_detected": failures_detected,
             "memories_retrieved": memories_retrieved_total,
@@ -866,9 +921,16 @@ def main():
             0.8,
         ),
         judge_max_tokens=config.get("judge", {}).get("max_tokens", 512),
+        detector_max_tokens=config.get("judge", {}).get("detector_max_tokens", 128),
+        repair_max_tokens=config.get("judge", {}).get("repair_max_tokens", 192),
         repair_confidence_threshold=config.get("judge", {}).get(
             "repair_confidence_threshold",
             0.7,
+        ),
+        enable_cache=config.get("judge", {}).get("enable_cache", True),
+        enable_repair_intent_filter=config.get("judge", {}).get(
+            "enable_repair_intent_filter",
+            True,
         ),
     )
 
@@ -901,6 +963,7 @@ def main():
         enable_safety_gate=config["memory"].get("enable_safety_gate", True),
         relevance_score_threshold=config["memory"].get("relevance_score_threshold", 0.45),
         enable_relevance_judge=config["memory"].get("enable_relevance_judge", False),
+        enable_intent_gate=config["memory"].get("enable_intent_gate", True),
         enable_rule_repair_advice=config.get("judge", {}).get(
             "enable_rule_repair_advice",
             True,

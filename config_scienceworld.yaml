@@ -5,12 +5,16 @@ llm:
   max_tokens: 256
 
 judge:
-  model: "deepseek-ai/DeepSeek-V3.2"
+  model: "Qwen/Qwen3.5-9B"
   base_url: "https://api.siliconflow.cn/v1"
   temperature: 0.0
   max_tokens: 512
+  detector_max_tokens: 128
+  repair_max_tokens: 192
+  enable_cache: true
   enable_implicit_failures: true
   enable_rule_repair_advice: true
+  enable_repair_intent_filter: true
   implicit_failure_confidence_threshold: 0.8
   repair_confidence_threshold: 0.7
 
@@ -34,6 +38,7 @@ memory:
   min_score: 0.0
   enable_failure_type_filter: true
   enable_safety_gate: true
+  enable_intent_gate: true
   relevance_score_threshold: 0.45
   enable_relevance_judge: false
   persist_dir: "./memory_store"

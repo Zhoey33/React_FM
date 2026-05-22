@@ -137,3 +137,32 @@ def test_summary_uses_step_records_for_current_run_retrieval_observability():
     assert memory_stats["injection_hits"] == 1
     assert memory_stats["store_total_retrievals"] == 50
     assert memory_stats["store_total_hits"] == 40
+
+
+def test_summary_reports_judge_call_and_token_breakdown():
+    results = [
+        {
+            "task_type": "melt",
+            "success": False,
+            "score": 10.0,
+            "total_steps": 3,
+            "total_tokens": 110,
+            "agent_tokens": 20,
+            "judge_tokens": 80,
+            "judge_detector_tokens": 50,
+            "judge_repair_tokens": 30,
+            "steps": [
+                {"judge_call_type": "implicit_detector", "judge_cache_hit": False},
+                {"judge_call_type": "cache", "judge_cache_hit": True},
+                {"judge_call_type": "repair_advice", "judge_cache_hit": False},
+            ],
+        }
+    ]
+
+    summary = compute_summary(results, mode="react_fm", memory_stats={})
+
+    assert summary["judge_tokens"] == 80
+    assert summary["judge_detector_tokens"] == 50
+    assert summary["judge_repair_tokens"] == 30
+    assert summary["judge_calls"] == 2
+    assert summary["judge_cache_hits"] == 1

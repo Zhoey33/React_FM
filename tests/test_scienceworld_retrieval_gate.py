@@ -137,3 +137,79 @@ def test_incompatible_failure_type_is_filtered_before_scoring():
     assert decision.selected_entry is None
     assert decision.filtered_by_type_count == 1
     assert decision.rejection_reason == "no_type_compatible_candidates"
+
+
+def test_navigation_syntax_does_not_match_object_transfer_memory():
+    decision = select_retrieval_memory(
+        entries=[
+            _entry(
+                memory_id=5,
+                failure_type="syntax_or_parse",
+                failure_action="put down unknown substance B in purple box",
+                failure_observation="No known action matches that input.",
+                repair_action="move unknown substance B to purple box",
+            )
+        ],
+        retrieval_scores=[0.0327],
+        current_failure_type="syntax_or_parse",
+        failed_action="go to living room",
+        failure_observation="No known action matches that input.",
+        recent_actions=["look around", "go to living room"],
+        relevance_score_threshold=0.45,
+    )
+
+    assert decision.selected_entry is None
+    assert decision.filtered_by_intent_count == 1
+    assert decision.current_intent == "navigation"
+    assert decision.candidate_intents == ["object_transfer"]
+    assert decision.rejection_reason == "intent_incompatible"
+
+
+def test_object_transfer_syntax_matches_object_transfer_memory():
+    decision = select_retrieval_memory(
+        entries=[
+            _entry(
+                memory_id=6,
+                failure_type="syntax_or_parse",
+                failure_action="put down unknown substance B in purple box",
+                failure_observation="No known action matches that input.",
+                repair_action="move unknown substance B to purple box",
+            )
+        ],
+        retrieval_scores=[0.0327],
+        current_failure_type="syntax_or_parse",
+        failed_action="put down unknown substance B in purple box",
+        failure_observation="No known action matches that input.",
+        recent_actions=["pick up unknown substance B"],
+        relevance_score_threshold=0.45,
+    )
+
+    assert decision.selected_entry is not None
+    assert decision.selected_entry.memory_id == 6
+    assert decision.relevance_decision is True
+    assert decision.current_intent == "object_transfer"
+    assert decision.candidate_intents == ["object_transfer"]
+
+
+def test_matching_failure_intent_still_rejects_incompatible_repair_intent():
+    decision = select_retrieval_memory(
+        entries=[
+            _entry(
+                memory_id=7,
+                failure_type="syntax_or_parse",
+                failure_action="go to living room",
+                failure_observation="No known action matches that input.",
+                repair_action="connect agent to kitchen",
+            )
+        ],
+        retrieval_scores=[0.0327],
+        current_failure_type="syntax_or_parse",
+        failed_action="go to living room",
+        failure_observation="No known action matches that input.",
+        recent_actions=["look around"],
+        relevance_score_threshold=0.45,
+    )
+
+    assert decision.selected_entry is None
+    assert decision.filtered_by_intent_count == 1
+    assert decision.rejection_reason == "repair_intent_incompatible"

@@ -9,8 +9,12 @@ judge:
   base_url: "https://api.siliconflow.cn/v1"
   temperature: 0.0
   max_tokens: 512
+  detector_max_tokens: 128
+  repair_max_tokens: 192
+  enable_cache: true
   enable_implicit_failures: true
   enable_rule_repair_advice: true
+  enable_repair_intent_filter: true
   implicit_failure_confidence_threshold: 0.8
   repair_confidence_threshold: 0.7
 
@@ -31,6 +35,7 @@ memory:
   max_entries: 500
   retrieval_top_k: 1
   min_score: 0.0
+  enable_intent_gate: true
   persist_dir: "./memory_store"
 
 alfworld:
