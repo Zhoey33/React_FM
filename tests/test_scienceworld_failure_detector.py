@@ -480,6 +480,29 @@ def test_generate_rule_repair_advice_requires_valid_action_when_available():
     assert advice is None
 
 
+def test_generate_rule_repair_advice_accepts_numeric_ambiguity_choice_when_valid():
+    detector = ScienceWorldFailureDetector(
+        judge_llm=FakeJudgeLLM(
+            '{"repair_strategy": "Choose the intended disambiguation option.", '
+            '"repair_action": "0", '
+            '"repair_confidence": 0.9, '
+            '"repair_rationale": "The environment asked for a numeric choice."}'
+        ),
+        repair_confidence_threshold=0.7,
+    )
+
+    advice = detector.generate_rule_repair_advice(
+        action="examine drawer",
+        observation="Ambiguous request. Please enter the number for the action you intended.",
+        failure_type="ambiguity",
+        failure_reason="Ambiguous request",
+        valid_actions_after_action=["0", "1"],
+    )
+
+    assert advice is not None
+    assert advice.repair_action == "0"
+
+
 def test_generate_rule_repair_advice_malformed_json_or_exception_returns_none():
     detectors = [
         ScienceWorldFailureDetector(judge_llm=FakeJudgeLLM("not json")),

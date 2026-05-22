@@ -561,9 +561,13 @@ def _normalize_action_text(action: str) -> str:
 def _matches_available_action(action: str, valid_actions: str | list[str]) -> bool:
     items = _valid_action_items(valid_actions)
     if not items:
-        return True
+        return False
     normalized = _normalize_action_text(action)
     return any(normalized == _normalize_action_text(item) for item in items)
+
+
+def _has_available_actions(valid_actions: str | list[str]) -> bool:
+    return bool(_valid_action_items(valid_actions))
 
 
 def _score_delta(
@@ -646,9 +650,11 @@ def _parse_repair_advice(
         return "", "", confidence, rationale
     if not strategy or not action:
         return "", "", confidence, rationale
-    if not _looks_like_scienceworld_action(action):
+    if _matches_available_action(action, valid_actions):
+        return strategy, action, confidence, rationale
+    if _has_available_actions(valid_actions):
         return "", "", confidence, rationale
-    if not _matches_available_action(action, valid_actions):
+    if not _looks_like_scienceworld_action(action):
         return "", "", confidence, rationale
     return strategy, action, confidence, rationale
 
