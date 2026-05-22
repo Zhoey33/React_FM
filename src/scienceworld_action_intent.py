@@ -24,12 +24,8 @@ _STOPWORDS = {
 
 _CIRCUIT_TERMS = {
     "battery",
-    "black",
     "circuit",
-    "connect",
     "electrical",
-    "lead",
-    "red",
     "terminal",
     "wire",
 }

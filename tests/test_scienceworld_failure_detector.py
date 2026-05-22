@@ -560,6 +560,38 @@ def test_generate_rule_repair_advice_rejects_semantically_invalid_connect_action
     assert "open door to kitchen" in prompt
 
 
+def test_generate_rule_repair_advice_rejects_connect_action_without_circuit_objects():
+    detector = ScienceWorldFailureDetector(
+        judge_llm=FakeJudgeLLM(
+            '{"repair_strategy": "Use a valid oven interaction.", '
+            '"repair_action": "connect apple to oven", '
+            '"repair_confidence": 0.95, '
+            '"repair_rationale": "The action is present in the valid action list."}'
+        ),
+        repair_confidence_threshold=0.7,
+    )
+
+    advice = detector.generate_rule_repair_advice(
+        action="open oven door",
+        observation="No known action matches that input.",
+        failure_type="syntax_or_parse",
+        failure_reason="Action not recognized",
+        task_goal="Your task is to melt lead.",
+        look_after_action="You see an oven, a lighter, an apple, and a metal pot.",
+        valid_actions_after_action=[
+            "connect apple to oven",
+            "connect oven to lighter",
+            "open oven",
+            "examine oven",
+        ],
+    )
+
+    assert advice is None
+    prompt = detector.judge_llm.prompts[0]["prompt"]
+    assert "connect apple to oven" not in prompt
+    assert "open oven" in prompt
+
+
 def test_generate_rule_repair_advice_accepts_connect_action_in_circuit_context():
     detector = ScienceWorldFailureDetector(
         judge_llm=FakeJudgeLLM(
