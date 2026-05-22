@@ -213,3 +213,33 @@ def test_matching_failure_intent_still_rejects_incompatible_repair_intent():
     assert decision.selected_entry is None
     assert decision.filtered_by_intent_count == 1
     assert decision.rejection_reason == "repair_intent_incompatible"
+
+
+def test_numeric_ambiguity_memory_does_not_transfer_across_different_menus():
+    decision = select_retrieval_memory(
+        entries=[
+            _entry(
+                memory_id=8,
+                failure_type="ambiguity",
+                failure_action="open door",
+                failure_observation=(
+                    "Ambiguous request: 0: open door between kitchen and hallway "
+                    "1: open door between bathroom and kitchen 2: open door to hallway"
+                ),
+                repair_action="2",
+            )
+        ],
+        retrieval_scores=[0.0327],
+        current_failure_type="ambiguity",
+        failed_action="open drawer",
+        failure_observation=(
+            "Ambiguous request: 0: open drawer in counter "
+            "1: open drawer in cupboard"
+        ),
+        recent_actions=["open drawer"],
+        relevance_score_threshold=0.45,
+    )
+
+    assert decision.selected_entry is None
+    assert decision.filtered_by_safety_count == 1
+    assert decision.rejection_reason == "numeric_repair_context_mismatch"

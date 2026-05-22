@@ -122,6 +122,17 @@ def _safety_rejection(
         return "candidate_missing_repair_action"
 
     normalized_failed = _normalize_action(failed_action)
+    if any(action.isdigit() for action in repair_actions):
+        memory_failed = _normalize_action(str(getattr(entry, "failure_action", "") or ""))
+        memory_observation = str(getattr(entry, "failure_observation", "") or "")
+        if (
+            current_failure_type != "ambiguity"
+            or not normalized_failed
+            or normalized_failed != memory_failed
+            or _overlap_score(failure_observation, memory_observation) < 0.45
+        ):
+            return "numeric_repair_context_mismatch"
+
     is_precondition_retry_repair = (
         current_failure_type == "precondition_blocked"
         and "door is not open" in failure_observation.lower()
