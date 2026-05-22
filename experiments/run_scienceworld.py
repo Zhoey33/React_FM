@@ -245,6 +245,13 @@ def _unpack_retrieval_result(result) -> tuple[list, list[float], int]:
     return result, [], len(result or [])
 
 
+def _memory_scope_for_protocol(memory_store) -> str | None:
+    """Return the active memory scope saved in ScienceWorld protocol metadata."""
+    if memory_store is None:
+        return None
+    return getattr(memory_store, "scope", "task_type")
+
+
 class ScienceWorldReActAgent:
     """ReAct agent adapted for ScienceWorld."""
 
@@ -337,6 +344,7 @@ class ScienceWorldReActAgent:
         current_retrieved = None
         current_failure_context = None
         current_judge_advice = None
+        pending_memory_record = None
         pending_judge_advice_record = None
         failures_detected = 0
         memories_retrieved_total = 0
@@ -366,6 +374,7 @@ class ScienceWorldReActAgent:
                 system_prompt = SYSTEM_PROMPT_FM
             else:
                 inject_judge_advice_now = bool(current_failure_context and current_judge_advice)
+                inject_memory_now = bool(current_failure_context and current_retrieved)
                 prompt = build_user_prompt(
                     task_type=task_type, task_obs=init_obs, history=self._prompt_history(history),
                     retrieved_memories=current_retrieved, memory_style=self.memory_style,
@@ -373,6 +382,14 @@ class ScienceWorldReActAgent:
                     judge_advice=current_judge_advice,
                 )
                 system_prompt = SYSTEM_PROMPT_FM
+                if inject_memory_now and pending_memory_record is not None:
+                    pending_memory_record["memory_retrieved"] = len(current_retrieved)
+                    pending_memory_record["memory_injected"] = True
+                    pending_memory_record["injected_memory_text"] = _format_retrieved_memory_text(
+                        current_retrieved
+                    )
+                    memories_retrieved_total += len(current_retrieved)
+                    pending_memory_record = None
                 if inject_judge_advice_now and pending_judge_advice_record is not None:
                     pending_judge_advice_record["judge_advice_injected"] = True
                     logger.info(
@@ -447,6 +464,7 @@ class ScienceWorldReActAgent:
                 "step": step_num, "action": action, "observation": observation[:200],
                 "is_think": False, "failure_detected": False, "failure_type": "",
                 "memory_retrieved": 0,
+                "memory_injected": False,
                 "retrieval_attempted": False,
                 "retrieval_mode": getattr(self.memory, "retrieval_mode", "") if self.memory else "",
                 "retrieval_top_k": self.max_memory_inject,
@@ -563,7 +581,6 @@ class ScienceWorldReActAgent:
                             )
                             if selected_index < len(decision.candidate_scores):
                                 selected_scores = [decision.candidate_scores[selected_index]]
-                        record["memory_retrieved"] = len(retrieved)
                         record["retrieval_candidate_count"] = candidate_count
                         record["retrieval_candidate_memory_ids"] = decision.candidate_memory_ids
                         record["retrieval_candidate_scores"] = decision.candidate_scores
@@ -581,7 +598,6 @@ class ScienceWorldReActAgent:
                         record["retrieved_memory_ids"] = [
                             entry.memory_id for entry in retrieved
                         ]
-                        record["injected_memory_text"] = _format_retrieved_memory_text(retrieved)
                         logger.info(
                             "    Retrieval candidates ids=%s scores=%s relevance=%s "
                             "selected=%s reason=%s",
@@ -591,7 +607,6 @@ class ScienceWorldReActAgent:
                             decision.selected_memory_id,
                             decision.rejection_reason,
                         )
-                        memories_retrieved_total += len(retrieved)
                         if retrieved:
                             current_retrieved = retrieved
                             current_failure_context = {
@@ -608,6 +623,7 @@ class ScienceWorldReActAgent:
                                     entry.memory_id,
                                     _format_memory_for_log(entry),
                                 )
+                            pending_memory_record = record
                         elif det.detector_source == "judge" and det.has_judge_repair_advice:
                             current_failure_context = {
                                 "action": action,
@@ -931,7 +947,7 @@ def main():
             max_variations=args.max_variations,
             step_limit=args.step_limit,
             test_time_writable=bool(not is_baseline and args.split == "test" and extractor_llm is not None),
-            memory_scope="task_type" if memory_store else None,
+            memory_scope=_memory_scope_for_protocol(memory_store),
             max_envs=max_envs,
         )
         env_count = 0

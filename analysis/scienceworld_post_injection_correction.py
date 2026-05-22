@@ -89,6 +89,7 @@ def _event_to_annotation(*, source_file: str, event: dict[str, Any]) -> dict[str
         "injected_memory_text": event.get("injected_memory_text", ""),
         "next_action": event.get("next_action", ""),
         "memory_mode": event.get("memory_mode", "unknown"),
+        "memory_injected": _as_bool(event.get("memory_injected")),
         "retrieval_attempted": _as_bool(event.get("retrieval_attempted")),
         "retrieval_hit": _as_bool(event.get("retrieval_hit")),
         "retrieval_mode": event.get("retrieval_mode", ""),

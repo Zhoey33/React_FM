@@ -143,6 +143,60 @@ def test_enabled_judge_prompt_contains_context_and_parses_failure_json():
     assert "open drawer -> examine drawer" in prompt
 
 
+def test_judge_prompt_includes_ten_recent_history_items():
+    judge = FakeJudgeLLM(
+        '{"is_failure": false, "failure_type": "productive", '
+        '"confidence": 0.2, "reason": "Recent exploration is productive.", '
+        '"evidence_for_failure": [], "evidence_against_failure": [], '
+        '"productive_signal": "new_info"}'
+    )
+    detector = ScienceWorldFailureDetector(
+        judge_llm=judge,
+        enable_implicit_failures=True,
+    )
+    history = [
+        {"step": idx, "action": f"action {idx}", "observation": f"obs {idx}", "score": 0}
+        for idx in range(12)
+    ]
+
+    detector.detect(
+        observation="You see a room.",
+        action="look around",
+        action_history=["look around"],
+        recent_history=history,
+    )
+
+    prompt = judge.prompts[0]["prompt"]
+    assert "Step: 1\n" not in prompt
+    assert "Action: action 2" in prompt
+    assert "Action: action 11" in prompt
+
+
+def test_valid_actions_prompt_keeps_context_relevant_actions_beyond_default_prefix():
+    judge = FakeJudgeLLM(
+        '{"is_failure": false, "failure_type": "productive", '
+        '"confidence": 0.2, "reason": "No failure.", '
+        '"evidence_for_failure": [], "evidence_against_failure": [], '
+        '"productive_signal": "none"}'
+    )
+    detector = ScienceWorldFailureDetector(
+        judge_llm=judge,
+        enable_implicit_failures=True,
+    )
+    valid_actions = [f"examine filler {idx}" for idx in range(35)]
+    valid_actions.append("open door to workshop")
+
+    detector.detect(
+        observation="You are still in the hallway.",
+        action="go to workshop",
+        action_history=["go to workshop"],
+        valid_actions_after_action=valid_actions,
+    )
+
+    prompt = judge.prompts[0]["prompt"]
+    assert "open door to workshop" in prompt
+
+
 def test_judge_non_failure_json_returns_non_failure():
     judge = FakeJudgeLLM(
         '{"is_failure": false, "failure_type": "productive", '

@@ -36,6 +36,10 @@ def _with_retrieval_observability(
 ) -> dict[str, Any]:
     """Add gated ScienceWorld retrieval counters without mutating store stats."""
     stats = dict(memory_stats)
+    if "total_retrievals" in memory_stats:
+        stats["store_total_retrievals"] = int(memory_stats.get("total_retrievals") or 0)
+    if "total_hits" in memory_stats:
+        stats["store_total_hits"] = int(memory_stats.get("total_hits") or 0)
     attempted = 0
     injection_hits = 0
     injected_memories = 0
@@ -48,13 +52,16 @@ def _with_retrieval_observability(
             candidate_count = int(step.get("retrieval_candidate_count") or 0)
             if candidate_count > 0:
                 candidate_hits_from_steps += 1
-            memory_retrieved = int(step.get("memory_retrieved") or 0)
+            if "memory_injected" in step:
+                memory_retrieved = int(step.get("memory_retrieved") or 0) if step.get("memory_injected") else 0
+            else:
+                memory_retrieved = int(step.get("memory_retrieved") or 0)
             if memory_retrieved > 0:
                 injection_hits += 1
                 injected_memories += memory_retrieved
 
-    stats["candidate_retrievals"] = int(stats.get("total_retrievals", attempted))
-    stats["candidate_hits"] = int(stats.get("total_hits", candidate_hits_from_steps))
+    stats["candidate_retrievals"] = attempted
+    stats["candidate_hits"] = candidate_hits_from_steps
     stats["in_loop_retrieval_attempts"] = attempted
     stats["injection_hits"] = injection_hits
     stats["injected_memories"] = injected_memories

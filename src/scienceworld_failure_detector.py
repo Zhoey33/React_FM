@@ -319,10 +319,32 @@ class ScienceWorldFailureDetector:
             score_delta=_score_delta(score_before_action, score_after_action),
             look_before_action=_compact_text(look_before_action or "unknown"),
             inventory_before_action=_compact_text(inventory_before_action or "unknown"),
-            valid_actions_before_action=_format_valid_actions(valid_actions_before_action),
+            valid_actions_before_action=_format_valid_actions(
+                valid_actions_before_action,
+                context_text=" ".join(
+                    [
+                        str(task_goal or ""),
+                        str(action or ""),
+                        str(observation or ""),
+                        str(look_before_action or ""),
+                        str(inventory_before_action or ""),
+                    ]
+                ),
+            ),
             look_after_action=_compact_text(look_after_action or "unknown"),
             inventory_after_action=_compact_text(inventory_after_action or "unknown"),
-            valid_actions_after_action=_format_valid_actions(valid_actions_after_action),
+            valid_actions_after_action=_format_valid_actions(
+                valid_actions_after_action,
+                context_text=" ".join(
+                    [
+                        str(task_goal or ""),
+                        str(action or ""),
+                        str(observation or ""),
+                        str(look_after_action or ""),
+                        str(inventory_after_action or ""),
+                    ]
+                ),
+            ),
         )
         try:
             response = self.judge_llm.complete_text(
@@ -442,7 +464,18 @@ class ScienceWorldFailureDetector:
             score_delta=_score_delta(score_before_action, score_after_action),
             look_after_action=_compact_text(look_after_action or "unknown"),
             inventory_after_action=_compact_text(inventory_after_action or "unknown"),
-            valid_actions_after_action=_format_valid_actions(valid_actions_after_action),
+            valid_actions_after_action=_format_valid_actions(
+                valid_actions_after_action,
+                context_text=" ".join(
+                    [
+                        str(task_goal or ""),
+                        str(action or ""),
+                        str(observation or ""),
+                        str(look_after_action or ""),
+                        str(inventory_after_action or ""),
+                    ]
+                ),
+            ),
         )
         try:
             response = self.judge_llm.complete_text(
@@ -508,7 +541,7 @@ def _compact_text(text: str, max_chars: int = 600) -> str:
 def _format_recent_history(
     recent_history: list[tuple[str, str]] | list[dict[str, Any]],
     *,
-    max_items: int = 5,
+    max_items: int = 10,
 ) -> str:
     if not recent_history:
         return "(none)"
@@ -533,17 +566,67 @@ def _format_recent_history(
     return "\n".join(lines)
 
 
-def _format_valid_actions(valid_actions: str | list[str], max_items: int = 30) -> str:
+def _format_valid_actions(
+    valid_actions: str | list[str],
+    max_items: int = 30,
+    *,
+    context_text: str = "",
+    max_extra_relevant: int = 20,
+) -> str:
     if isinstance(valid_actions, str):
         items = [line.strip() for line in valid_actions.splitlines() if line.strip()]
     else:
         items = [str(item).strip() for item in valid_actions if str(item).strip()]
     if not items:
         return "unknown"
-    text = "\n".join(items[:max_items])
-    if len(items) > max_items:
-        text += f"\n... ({len(items) - max_items} more)"
+    selected = list(items[:max_items])
+    if context_text and len(items) > max_items:
+        selected_norm = {_normalize_action_text(item) for item in selected}
+        context_tokens = _action_context_tokens(context_text)
+        relevant_tail = []
+        for item in items[max_items:]:
+            normalized = _normalize_action_text(item)
+            if normalized in selected_norm:
+                continue
+            if _action_context_tokens(item) & context_tokens:
+                relevant_tail.append(item)
+                selected_norm.add(normalized)
+            if len(relevant_tail) >= max_extra_relevant:
+                break
+        selected.extend(relevant_tail)
+    text = "\n".join(selected)
+    hidden_count = len(items) - len(selected)
+    if hidden_count > 0:
+        text += f"\n... ({hidden_count} more)"
     return text
+
+
+def _action_context_tokens(text: str) -> set[str]:
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "in",
+        "is",
+        "it",
+        "not",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "there",
+        "to",
+        "with",
+        "you",
+    }
+    tokens: set[str] = set()
+    for raw_token in str(text).lower().replace("_", " ").split():
+        token = raw_token.strip(".,:;!?()[]")
+        if len(token) > 1 and token not in stopwords:
+            tokens.add(token)
+    return tokens
 
 
 def _valid_action_items(valid_actions: str | list[str]) -> list[str]:

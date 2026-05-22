@@ -29,6 +29,7 @@ def test_build_failure_events_records_recovery_window():
                 "judge_advice_source": "rule_repair_judge",
                 "judge_advice_injected": True,
                 "memory_retrieved": 1,
+                "memory_injected": True,
                 "retrieved_memory_ids": [17],
                 "retrieved_memory_scores": [0.0325],
                 "retrieval_mode": "hybrid",
@@ -78,6 +79,7 @@ def test_build_failure_events_records_recovery_window():
             "failed_action": "move to workshop",
             "failure_observation": "You move to the workshop.",
             "memory_mode": "in_loop",
+            "memory_injected": True,
             "retrieval_attempted": True,
             "retrieval_hit": True,
             "retrieved_memory_ids": [17],
@@ -102,5 +104,33 @@ def test_build_failure_events_records_recovery_window():
             "score_after_3_steps": 16.0,
             "recovered_within_1_step": False,
             "recovered_within_3_steps": True,
-        }
-    ]
+            }
+        ]
+
+
+def test_failure_event_retrieval_hit_requires_actual_memory_injection():
+    episode = {
+        "env_idx": 1,
+        "task_type": "melt",
+        "variation_idx": 0,
+        "steps": [
+            {
+                "step": 0,
+                "action": "look around",
+                "observation": "You see the same room.",
+                "failure_detected": True,
+                "failure_type": "implicit_no_progress",
+                "memory_retrieved": 1,
+                "memory_injected": False,
+                "retrieved_memory_ids": [7],
+                "retrieval_selected_memory_id": 7,
+                "score_before_action": 0.0,
+                "score_after_action": 0.0,
+            }
+        ],
+    }
+
+    event = build_failure_events(episode, memory_mode="in_loop")[0]
+
+    assert event["retrieved_memory_ids"] == [7]
+    assert event["retrieval_hit"] is False

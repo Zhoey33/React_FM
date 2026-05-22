@@ -42,7 +42,10 @@ def build_failure_events(episode: dict[str, Any], *, memory_mode: str) -> list[d
         score_after_1 = _score_at(steps, index, 1)
         score_after_2 = _score_at(steps, index, 2)
         score_after_3 = _score_at(steps, index, 3)
-        retrieval_hit = bool(step.get("memory_retrieved", 0))
+        if "memory_injected" in step:
+            retrieval_hit = bool(step.get("memory_injected"))
+        else:
+            retrieval_hit = bool(step.get("memory_retrieved", 0))
 
         events.append(
             {
@@ -67,6 +70,7 @@ def build_failure_events(episode: dict[str, Any], *, memory_mode: str) -> list[d
                 "failed_action": step.get("action", ""),
                 "failure_observation": step.get("observation", ""),
                 "memory_mode": memory_mode,
+                "memory_injected": bool(step.get("memory_injected", retrieval_hit)),
                 "retrieval_attempted": bool(step.get("retrieval_attempted", retrieval_hit)),
                 "retrieval_hit": retrieval_hit,
                 "retrieved_memory_ids": step.get("retrieved_memory_ids", []),

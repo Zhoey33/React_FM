@@ -130,6 +130,7 @@ class FakeMemory:
         self.add_calls = []
         self.min_score = 0.25
         self.retrieval_mode = "hybrid"
+        self.scope = "task_type"
         self.retrieval_result = retrieval_result or RetrievalResult([], [], candidate_count=4)
 
     def retrieve(self, **kwargs):
@@ -440,6 +441,46 @@ def test_retrieved_memory_takes_priority_over_judge_advice():
             candidate_count=1,
         )
     )
+    llm = _PromptRecordingLLM()
+    agent = run_scienceworld.ScienceWorldReActAgent(
+        llm=llm,
+        memory_store=memory,
+        failure_detector=detector,
+        extractor_llm=None,
+        max_steps=2,
+        max_memory_inject=1,
+        enable_memory=True,
+        inject_mode="in_loop",
+    )
+
+    result = agent.run_episode(FakeEnv(), env_idx=7)
+
+    step = result["steps"][0]
+    assert step["memory_retrieved"] == 1
+    assert step["memory_injected"] is True
+    assert step["retrieved_memory_ids"] == [31]
+    assert step["judge_advice_injected"] is False
+    assert "Retrieved repair memory:" in llm.prompts[1]
+
+
+def test_retrieved_memory_scheduled_on_last_step_is_not_marked_injected():
+    detector = FakeDetector()
+    memory = FakeMemory(
+        RetrievalResult(
+            [
+                FakeMemoryEntry(
+                    memory_id=32,
+                    failure_type="implicit_no_progress",
+                    failure_action="look around",
+                    failure_observation="You see the same room.",
+                    repair_action="inventory",
+                    confidence_score=0.9,
+                )
+            ],
+            [0.04],
+            candidate_count=1,
+        )
+    )
     agent = run_scienceworld.ScienceWorldReActAgent(
         llm=FakeLLM(),
         memory_store=memory,
@@ -454,9 +495,10 @@ def test_retrieved_memory_takes_priority_over_judge_advice():
     result = agent.run_episode(FakeEnv(), env_idx=7)
 
     step = result["steps"][0]
-    assert step["memory_retrieved"] == 1
-    assert step["retrieved_memory_ids"] == [31]
-    assert step["judge_advice_injected"] is False
+    assert step["retrieval_selected_memory_id"] == 32
+    assert step["retrieved_memory_ids"] == [32]
+    assert step["memory_retrieved"] == 0
+    assert step["memory_injected"] is False
 
 
 def test_rule_failure_retrieval_miss_injects_rule_repair_advice_once():
@@ -532,7 +574,9 @@ def test_rule_failure_retrieval_hit_does_not_call_rule_repair_advice():
     result = agent.run_episode(FakeEnv(), env_idx=7)
 
     step = result["steps"][0]
-    assert step["memory_retrieved"] == 1
+    assert step["retrieval_selected_memory_id"] == 41
+    assert step["memory_retrieved"] == 0
+    assert step["memory_injected"] is False
     assert step["judge_advice_injected"] is False
     assert step["judge_advice_source"] == ""
     assert detector.repair_calls == []
@@ -558,3 +602,10 @@ def test_rule_repair_advice_scheduled_on_last_step_is_not_marked_injected():
     assert detector.repair_calls
     assert step["judge_advice_source"] == "rule_repair_judge"
     assert step["judge_advice_injected"] is False
+
+
+def test_memory_scope_metadata_uses_loaded_store_scope():
+    memory = FakeMemory()
+    memory.scope = "env_idx"
+
+    assert run_scienceworld._memory_scope_for_protocol(memory) == "env_idx"
