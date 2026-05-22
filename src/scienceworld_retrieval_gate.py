@@ -113,12 +113,21 @@ def _safety_rejection(
         return "candidate_missing_repair_action"
 
     normalized_failed = _normalize_action(failed_action)
+    is_precondition_retry_repair = (
+        current_failure_type == "precondition_blocked"
+        and "door is not open" in failure_observation.lower()
+        and any(action.startswith("open door") for action in repair_actions)
+    )
     if current_failure_type in {"action_loop", "redundant_repeat"}:
         recent = {_normalize_action(action) for action in recent_actions[-2:]}
         if any(action in recent for action in repair_actions):
             return "candidate_would_repeat_recent_action"
 
-    if normalized_failed and normalized_failed in repair_actions:
+    if (
+        normalized_failed
+        and normalized_failed in repair_actions
+        and not is_precondition_retry_repair
+    ):
         return "candidate_would_repeat_failed_action"
 
     if "no known action matches that input" in failure_observation.lower():

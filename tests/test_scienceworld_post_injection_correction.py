@@ -117,6 +117,47 @@ def _write_failure_events(path):
             "recovered_within_1_step": False,
             "recovered_within_3_steps": False,
         },
+        {
+            "episode_id": "sw_004",
+            "env_idx": 4,
+            "task_type": "melt",
+            "variation_idx": 6,
+            "step": 12,
+            "failure_type": "syntax_or_parse",
+            "failed_action": "open freezer door",
+            "failure_observation": "No known action matches that input.",
+            "memory_mode": "in_loop",
+            "retrieval_attempted": True,
+            "retrieval_hit": False,
+            "retrieved_memory_ids": [],
+            "retrieved_memory_scores": [],
+            "retrieval_mode": "hybrid",
+            "retrieval_top_k": 1,
+            "retrieval_min_score": 0.0,
+            "retrieval_candidate_count": 0,
+            "retrieval_candidate_memory_ids": [],
+            "retrieval_candidate_scores": [],
+            "retrieval_candidate_relevance_scores": [],
+            "retrieval_selected_memory_id": None,
+            "retrieval_relevance_decision": False,
+            "retrieval_rejection_reason": "no_candidates",
+            "retrieval_filtered_by_type_count": 0,
+            "retrieval_filtered_by_safety_count": 0,
+            "injected_memory_text": "",
+            "judge_advice_source": "rule_repair_judge",
+            "judge_advice_injected": True,
+            "judge_repair_strategy": "Use the valid object name.",
+            "judge_repair_action": "open freezer",
+            "judge_repair_confidence": 0.9,
+            "judge_repair_rationale": "The environment rejected the longer command.",
+            "next_action": "open freezer",
+            "score_before_failure": 12.0,
+            "score_after_1_step": 12.0,
+            "score_after_2_steps": 18.0,
+            "score_after_3_steps": 18.0,
+            "recovered_within_1_step": False,
+            "recovered_within_3_steps": True,
+        },
     ]
     path.write_text(
         "\n".join(json.dumps(event) for event in events),
@@ -132,8 +173,8 @@ def test_make_post_injection_template_samples_injected_events_only(tmp_path):
     second = make_post_injection_template([event_path], max_samples=10, seed=5)
 
     assert first == second
-    assert len(first) == 2
-    assert {row["episode_id"] for row in first} == {"sw_001", "sw_002"}
+    assert len(first) == 3
+    assert {row["episode_id"] for row in first} == {"sw_001", "sw_002", "sw_004"}
 
     row = next(item for item in first if item["episode_id"] == "sw_001")
     assert set(row) == {
@@ -166,6 +207,12 @@ def test_make_post_injection_template_samples_injected_events_only(tmp_path):
         "retrieval_rejection_reason",
         "retrieval_filtered_by_type_count",
         "retrieval_filtered_by_safety_count",
+        "judge_advice_source",
+        "judge_advice_injected",
+        "judge_repair_strategy",
+        "judge_repair_action",
+        "judge_repair_confidence",
+        "judge_repair_rationale",
         "score_before_failure",
         "score_after_1_step",
         "score_after_2_steps",
@@ -195,6 +242,12 @@ def test_make_post_injection_template_samples_injected_events_only(tmp_path):
     assert row["gold_used_memory"] is None
     assert row["gold_injection_harmful"] is None
     assert row["annotation_notes"] == ""
+
+    advice_row = next(item for item in first if item["episode_id"] == "sw_004")
+    assert advice_row["retrieval_hit"] is False
+    assert advice_row["judge_advice_injected"] is True
+    assert advice_row["judge_advice_source"] == "rule_repair_judge"
+    assert advice_row["judge_repair_action"] == "open freezer"
 
 
 def test_make_post_injection_template_respects_max_samples(tmp_path):

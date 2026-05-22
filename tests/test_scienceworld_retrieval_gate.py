@@ -45,6 +45,27 @@ def test_precondition_blocked_open_door_memory_passes_gate():
     assert decision.rejection_reason == ""
 
 
+def test_precondition_blocked_allows_open_door_then_retry_failed_move():
+    decision = select_retrieval_memory(
+        entries=[
+            _entry(
+                failure_action="go to kitchen",
+                repair_action="open door to kitchen -> go to kitchen",
+            )
+        ],
+        retrieval_scores=[0.0327],
+        current_failure_type="precondition_blocked",
+        failed_action="go to kitchen",
+        failure_observation="The door is not open.",
+        recent_actions=["look around", "go to kitchen"],
+        relevance_score_threshold=0.45,
+    )
+
+    assert decision.selected_entry is not None
+    assert decision.relevance_decision is True
+    assert decision.rejection_reason == ""
+
+
 def test_syntax_parse_rejects_repeating_invalid_action():
     decision = select_retrieval_memory(
         entries=[

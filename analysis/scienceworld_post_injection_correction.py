@@ -68,7 +68,8 @@ def _as_float(value: Any) -> float | None:
 def _has_injection(event: dict[str, Any]) -> bool:
     retrieval_hit = _as_bool(event.get("retrieval_hit"))
     injected_text = str(event.get("injected_memory_text", "")).strip()
-    return bool(retrieval_hit) or bool(injected_text)
+    judge_advice_injected = _as_bool(event.get("judge_advice_injected"))
+    return bool(retrieval_hit) or bool(injected_text) or bool(judge_advice_injected)
 
 
 def _event_to_annotation(*, source_file: str, event: dict[str, Any]) -> dict[str, Any]:
@@ -106,6 +107,12 @@ def _event_to_annotation(*, source_file: str, event: dict[str, Any]) -> dict[str
         "retrieval_filtered_by_safety_count": event.get(
             "retrieval_filtered_by_safety_count", 0
         ),
+        "judge_advice_source": event.get("judge_advice_source", ""),
+        "judge_advice_injected": _as_bool(event.get("judge_advice_injected")),
+        "judge_repair_strategy": event.get("judge_repair_strategy", ""),
+        "judge_repair_action": event.get("judge_repair_action", ""),
+        "judge_repair_confidence": event.get("judge_repair_confidence"),
+        "judge_repair_rationale": event.get("judge_repair_rationale", ""),
         "score_before_failure": event.get("score_before_failure"),
         "score_after_1_step": event.get("score_after_1_step"),
         "score_after_2_steps": event.get("score_after_2_steps"),
@@ -302,6 +309,8 @@ def summarize_post_injection_files(
         "by_failure_type": _group_by(rows, "failure_type"),
         "by_memory_mode": _group_by(rows, "memory_mode"),
         "by_retrieval_hit": _group_by(rows, "retrieval_hit"),
+        "by_judge_advice_source": _group_by(rows, "judge_advice_source"),
+        "by_judge_advice_injected": _group_by(rows, "judge_advice_injected"),
         "by_gold_used_memory": _group_by(rows, "gold_used_memory"),
         "skipped_unlabeled": skipped_unlabeled,
     }
