@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 _EXPLICIT_FAILURE_PATTERNS: list[tuple[str, str]] = [
+    ("unknown action", "syntax_or_parse"),
     ("ambiguous request", "ambiguity"),
     ("please enter the number for the action you intended", "ambiguity"),
     ("the door is not open", "precondition_blocked"),
@@ -27,6 +28,13 @@ ALLOWED_JUDGE_FAILURE_TYPES = {
     "irrelevant_action",
     "premature_action",
 }
+
+_SCIENCEWORLD_ACTION_PREFIXES = (
+    "go to", "pick up", "put down", "open", "close", "activate", "deactivate",
+    "use", "pour", "mix", "focus on", "wait", "look around", "look", "inventory",
+    "examine", "read", "connect", "move", "teleport to", "dunk", "eat", "drink",
+    "flush", "reset task",
+)
 
 JUDGE_PROMPT = """You are judging whether one ScienceWorld agent interaction is an implicit failure.
 
@@ -87,8 +95,16 @@ Return ONLY valid JSON with this schema:
   "reason": "short explanation",
   "evidence_for_failure": ["concrete evidence"],
   "evidence_against_failure": ["counter-evidence"],
-  "productive_signal": "new_info" | "state_change" | "task_relevant_probe" | "time_progress" | "none"
-}}"""
+  "productive_signal": "new_info" | "state_change" | "task_relevant_probe" | "time_progress" | "none",
+  "repair_strategy": "high-level immediate repair direction, or empty string",
+  "repair_action": "one valid next ScienceWorld action, or empty string",
+  "repair_confidence": number between 0 and 1,
+  "repair_rationale": "short explanation for the suggested repair"
+}}
+
+Keep reason/rationale under 25 words. Use at most 2 evidence items per list.
+If is_failure is false, set repair_strategy, repair_action, and repair_rationale to empty strings,
+and repair_confidence to 0.0."""
 
 
 @dataclass
@@ -101,6 +117,14 @@ class DetectionResult:
     evidence_for_failure: list[str] | None = None
     evidence_against_failure: list[str] | None = None
     productive_signal: str = ""
+    judge_repair_strategy: str = ""
+    judge_repair_action: str = ""
+    judge_repair_confidence: float | None = None
+    judge_repair_rationale: str = ""
+
+    @property
+    def has_judge_repair_advice(self) -> bool:
+        return bool(self.judge_repair_strategy and self.judge_repair_action)
 
 
 class ScienceWorldFailureDetector:
@@ -110,13 +134,15 @@ class ScienceWorldFailureDetector:
         judge_llm: LLMClient | None = None,
         enable_implicit_failures: bool = False,
         implicit_failure_confidence_threshold: float = 0.8,
-        judge_max_tokens: int = 256,
+        judge_max_tokens: int = 512,
+        repair_confidence_threshold: float = 0.7,
     ):
         self.loop_window = loop_window
         self.judge_llm = judge_llm
         self.enable_implicit_failures = enable_implicit_failures
         self.implicit_failure_confidence_threshold = implicit_failure_confidence_threshold
         self.judge_max_tokens = judge_max_tokens
+        self.repair_confidence_threshold = repair_confidence_threshold
 
     def detect(
         self,
@@ -243,13 +269,27 @@ class ScienceWorldFailureDetector:
                 label="judge",
                 max_tokens=self.judge_max_tokens,
             )
-            payload = _parse_judge_json(response)
+            try:
+                payload = _parse_judge_json(response)
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(
+                    "Judge JSON parse failed: %s response=%s",
+                    e,
+                    _compact_text(response, max_chars=500),
+                )
+                return DetectionResult(is_failure=False)
             is_failure = _as_bool(payload.get("is_failure"))
             confidence = _as_confidence(payload.get("confidence"))
             evidence_for = _as_string_list(payload.get("evidence_for_failure"))
             evidence_against = _as_string_list(payload.get("evidence_against_failure"))
             productive_signal = str(payload.get("productive_signal", "") or "none").strip()
             reason = str(payload.get("reason", "")).strip()
+            repair_strategy, repair_action, repair_confidence, repair_rationale = (
+                _parse_repair_advice(
+                    payload,
+                    confidence_threshold=self.repair_confidence_threshold,
+                )
+            )
             if not is_failure:
                 logger.info(
                     "Judge result: non_failure confidence=%s productive_signal=%s reason=%s",
@@ -294,6 +334,10 @@ class ScienceWorldFailureDetector:
                 evidence_for_failure=evidence_for,
                 evidence_against_failure=evidence_against,
                 productive_signal=productive_signal,
+                judge_repair_strategy=repair_strategy,
+                judge_repair_action=repair_action,
+                judge_repair_confidence=repair_confidence,
+                judge_repair_rationale=repair_rationale,
             )
         except Exception as e:
             logger.warning(f"Judge LLM call failed: {e}")
@@ -421,6 +465,31 @@ def _as_string_list(value: Any) -> list[str]:
     if isinstance(value, str) and value.strip():
         return [value.strip()]
     return []
+
+
+def _parse_repair_advice(
+    payload: dict[str, Any],
+    *,
+    confidence_threshold: float,
+) -> tuple[str, str, float | None, str]:
+    strategy = str(payload.get("repair_strategy", "") or "").strip()
+    action = str(payload.get("repair_action", "") or "").strip()
+    confidence = _as_confidence(payload.get("repair_confidence"))
+    rationale = str(payload.get("repair_rationale", "") or "").strip()
+    if confidence is None or confidence < confidence_threshold:
+        return "", "", confidence, rationale
+    if not strategy or not action:
+        return "", "", confidence, rationale
+    if not _looks_like_scienceworld_action(action):
+        return "", "", confidence, rationale
+    return strategy, action, confidence, rationale
+
+
+def _looks_like_scienceworld_action(action: str) -> bool:
+    normalized = action.strip().lower()
+    if "\n" in normalized or "->" in normalized or ";" in normalized:
+        return False
+    return any(normalized == prefix or normalized.startswith(f"{prefix} ") for prefix in _SCIENCEWORLD_ACTION_PREFIXES)
 
 
 def _accept_judge_failure(

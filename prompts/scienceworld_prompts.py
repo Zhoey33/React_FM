@@ -104,6 +104,38 @@ def _format_fixed_memory_block(retrieved_memories: list, failure_context: dict) 
     return "\n".join(lines)
 
 
+def _format_judge_advice_block(failure_context: dict, judge_advice: dict) -> str:
+    """Format unverified judge advice used only when no memory was retrieved."""
+    lines = [
+        "Previous action appears to have failed.",
+        f"Failed action: {failure_context.get('action', '')}",
+        f"Failure observation: {failure_context.get('observation', '')}",
+        f"Failure type: {failure_context.get('failure_type', '')}",
+        f"Detector source: {failure_context.get('detector_source', '')}",
+    ]
+    reason = failure_context.get("failure_reason", "")
+    if reason:
+        lines.append(f"Detector reason: {reason}")
+
+    lines.extend(
+        [
+            "",
+            "No verified memory was retrieved.",
+            "",
+            "Unverified immediate judge suggestion:",
+            f"Repair strategy: {judge_advice.get('repair_strategy', '')}",
+            f"Suggested next action: {judge_advice.get('repair_action', '')}",
+        ]
+    )
+    rationale = judge_advice.get("repair_rationale", "")
+    if rationale:
+        lines.append(f"Rationale: {rationale}")
+
+    lines.append("")
+    lines.append("Use this suggestion only if it applies to the current state. Output one valid next action.")
+    return "\n".join(lines)
+
+
 def build_baseline_user_prompt(
     task_type: str,
     task_obs: str,
@@ -132,6 +164,7 @@ def build_user_prompt(
     memory_style: str = "original",
     hint_text: str | None = None,
     failure_context: dict | None = None,
+    judge_advice: dict | None = None,
 ) -> str:
     """Build user prompt for ScienceWorld, matching ALFWorld interface."""
     if retrieved_memories and failure_context:
@@ -143,6 +176,20 @@ def build_user_prompt(
         for action, obs in history:
             prompt += format_step(action, obs)
         prompt += "\n" + _format_fixed_memory_block(retrieved_memories, failure_context) + "\n"
+        if hint_text:
+            prompt += f"\n{hint_text}\n"
+        prompt += "> "
+        return prompt
+
+    if judge_advice and failure_context:
+        sections = [
+            get_fewshot_examples(task_type),
+            "Here is the task.\n" + task_obs,
+        ]
+        prompt = "\n\n".join(sections) + "\n"
+        for action, obs in history:
+            prompt += format_step(action, obs)
+        prompt += "\n" + _format_judge_advice_block(failure_context, judge_advice) + "\n"
         if hint_text:
             prompt += f"\n{hint_text}\n"
         prompt += "> "

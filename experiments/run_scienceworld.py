@@ -333,6 +333,8 @@ class ScienceWorldReActAgent:
 
         current_retrieved = None
         current_failure_context = None
+        current_judge_advice = None
+        pending_judge_advice_record = None
         failures_detected = 0
         memories_retrieved_total = 0
         consecutive_thinks = 0
@@ -360,12 +362,25 @@ class ScienceWorldReActAgent:
                 )
                 system_prompt = SYSTEM_PROMPT_FM
             else:
+                inject_judge_advice_now = bool(current_failure_context and current_judge_advice)
                 prompt = build_user_prompt(
                     task_type=task_type, task_obs=init_obs, history=self._prompt_history(history),
                     retrieved_memories=current_retrieved, memory_style=self.memory_style,
                     failure_context=current_failure_context,
+                    judge_advice=current_judge_advice,
                 )
                 system_prompt = SYSTEM_PROMPT_FM
+                if inject_judge_advice_now and pending_judge_advice_record is not None:
+                    pending_judge_advice_record["judge_advice_injected"] = True
+                    logger.info(
+                        "    Injecting judge advice fallback: strategy=%s action=%s "
+                        "confidence=%s rationale=%s",
+                        _compact_log_text(current_judge_advice.get("repair_strategy", ""), 160),
+                        _compact_log_text(current_judge_advice.get("repair_action", ""), 120),
+                        current_judge_advice.get("repair_confidence"),
+                        _compact_log_text(current_judge_advice.get("repair_rationale", ""), 180),
+                    )
+                    pending_judge_advice_record = None
 
             response = self.llm.complete_text(
                 prompt, stop=["\n"], label=f"step_{step_num}",
@@ -376,6 +391,7 @@ class ScienceWorldReActAgent:
             if self.inject_mode == "in_loop":
                 current_retrieved = None
                 current_failure_context = None
+                current_judge_advice = None
 
             if action.startswith("> "):
                 action = action[2:]
@@ -452,6 +468,11 @@ class ScienceWorldReActAgent:
                 "productive_signal": "",
                 "evidence_for_failure": [],
                 "evidence_against_failure": [],
+                "judge_repair_strategy": "",
+                "judge_repair_action": "",
+                "judge_repair_confidence": None,
+                "judge_repair_rationale": "",
+                "judge_advice_injected": False,
             }
 
             if (
@@ -487,6 +508,10 @@ class ScienceWorldReActAgent:
                     record["productive_signal"] = det.productive_signal
                     record["evidence_for_failure"] = det.evidence_for_failure or []
                     record["evidence_against_failure"] = det.evidence_against_failure or []
+                    record["judge_repair_strategy"] = det.judge_repair_strategy
+                    record["judge_repair_action"] = det.judge_repair_action
+                    record["judge_repair_confidence"] = det.judge_repair_confidence
+                    record["judge_repair_rationale"] = det.judge_repair_rationale
                     failures_detected += 1
                     logger.info(
                         "    FAILURE detected: %s detector=%s confidence=%s "
@@ -578,6 +603,29 @@ class ScienceWorldReActAgent:
                                     entry.memory_id,
                                     _format_memory_for_log(entry),
                                 )
+                        elif det.detector_source == "judge" and det.has_judge_repair_advice:
+                            current_failure_context = {
+                                "action": action,
+                                "observation": observation,
+                                "failure_type": det.failure_type,
+                                "detector_source": det.detector_source,
+                                "failure_reason": det.reason,
+                            }
+                            current_judge_advice = {
+                                "repair_strategy": det.judge_repair_strategy,
+                                "repair_action": det.judge_repair_action,
+                                "repair_confidence": det.judge_repair_confidence,
+                                "repair_rationale": det.judge_repair_rationale,
+                            }
+                            pending_judge_advice_record = record
+                            logger.info(
+                                "    Scheduling judge advice fallback: strategy=%s action=%s "
+                                "confidence=%s rationale=%s",
+                                _compact_log_text(det.judge_repair_strategy, 160),
+                                _compact_log_text(det.judge_repair_action, 120),
+                                det.judge_repair_confidence,
+                                _compact_log_text(det.judge_repair_rationale, 180),
+                            )
 
             steps.append(record)
             history.append((action, observation))
@@ -746,7 +794,11 @@ def main():
             "implicit_failure_confidence_threshold",
             0.8,
         ),
-        judge_max_tokens=config.get("judge", {}).get("max_tokens", 256),
+        judge_max_tokens=config.get("judge", {}).get("max_tokens", 512),
+        repair_confidence_threshold=config.get("judge", {}).get(
+            "repair_confidence_threshold",
+            0.7,
+        ),
     )
 
     extractor_llm = None

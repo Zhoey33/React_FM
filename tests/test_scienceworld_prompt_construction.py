@@ -31,6 +31,15 @@ def _failure_context() -> dict:
     }
 
 
+def _judge_advice() -> dict:
+    return {
+        "repair_strategy": "Stop repeating the same observation and inspect available options.",
+        "repair_action": "inventory",
+        "repair_confidence": 0.86,
+        "repair_rationale": "Inventory can reveal carried tools before choosing the next action.",
+    }
+
+
 def test_baseline_prompt_has_no_memory_or_failure_block():
     prompt = build_baseline_user_prompt(
         task_type="melt",
@@ -41,6 +50,7 @@ def test_baseline_prompt_has_no_memory_or_failure_block():
     assert "Here is the task." in prompt
     assert "Retrieved repair memory" not in prompt
     assert "Previous action appears to have failed" not in prompt
+    assert "Unverified immediate judge suggestion" not in prompt
     assert "question_text" not in prompt
     assert prompt.endswith("> ")
 
@@ -68,6 +78,7 @@ def test_in_loop_prompt_places_failure_and_memory_after_history():
     assert "Failure observation: The door is not open." in prompt
     assert "Failure type: precondition_blocked" in prompt
     assert "Detector source: rule" in prompt
+    assert "Unverified immediate judge suggestion" not in prompt
     assert "Past failed action: go to kitchen" in prompt
     assert "Past failure observation: The door is not open." in prompt
     assert "Repair strategy: Satisfy the missing precondition" in prompt
@@ -76,6 +87,35 @@ def test_in_loop_prompt_places_failure_and_memory_after_history():
     assert "Use the memory only if it applies to the current state." in prompt
     assert "question_text" not in prompt
     assert "0.99" not in prompt
+
+
+def test_in_loop_prompt_can_use_judge_advice_when_no_memory_was_retrieved():
+    prompt = build_user_prompt(
+        task_type="melt",
+        task_obs="Your task is to melt tin.",
+        history=[("look around", "The room is unchanged.")],
+        retrieved_memories=None,
+        failure_context={
+            "action": "look around",
+            "observation": "The room is unchanged.",
+            "failure_type": "implicit_no_progress",
+            "detector_source": "judge",
+            "failure_reason": "The action repeated prior exploration.",
+        },
+        judge_advice=_judge_advice(),
+    )
+
+    failure_pos = prompt.index("Previous action appears to have failed.")
+    no_memory_pos = prompt.index("No verified memory was retrieved.")
+    advice_pos = prompt.index("Unverified immediate judge suggestion:")
+    action_cue_pos = prompt.rindex("> ")
+
+    assert failure_pos < no_memory_pos < advice_pos < action_cue_pos
+    assert "Retrieved repair memory:" not in prompt
+    assert "Repair strategy: Stop repeating the same observation" in prompt
+    assert "Suggested next action: inventory" in prompt
+    assert "Rationale: Inventory can reveal carried tools" in prompt
+    assert "0.86" not in prompt
 
 
 def test_scienceworld_agent_prompt_history_window_keeps_recent_steps_only():
@@ -131,6 +171,10 @@ class _DetectorOnce:
                 reason="No new information.",
                 confidence=0.8,
                 detector_source="judge",
+                judge_repair_strategy="Check inventory instead of repeating exploration.",
+                judge_repair_action="inventory",
+                judge_repair_confidence=0.9,
+                judge_repair_rationale="Inventory can reveal carried items.",
             )
         return DetectionResult(is_failure=False)
 
@@ -150,6 +194,14 @@ class _MemoryHit:
 
     def retrieve(self, **kwargs):
         return RetrievalResult([self.entry], [0.03], candidate_count=1)
+
+
+class _MemoryMiss:
+    min_score = 0.0
+    retrieval_mode = "hybrid"
+
+    def retrieve(self, **kwargs):
+        return RetrievalResult([], [], candidate_count=0)
 
 
 class _NoopEnv:
@@ -179,4 +231,29 @@ def test_runner_injects_failure_memory_prompt_once_after_retrieval():
     assert "Previous action appears to have failed." in llm.prompts[1]
     assert "Failed action: look around" in llm.prompts[1]
     assert "Retrieved repair memory:" in llm.prompts[1]
+    assert "Unverified immediate judge suggestion:" not in llm.prompts[1]
     assert "Previous action appears to have failed." not in llm.prompts[2]
+
+
+def test_runner_injects_judge_advice_once_when_retrieval_misses():
+    llm = _PromptRecordingLLM()
+    agent = run_scienceworld.ScienceWorldReActAgent(
+        llm=llm,
+        memory_store=_MemoryMiss(),
+        failure_detector=_DetectorOnce(),
+        extractor_llm=None,
+        max_steps=3,
+        prompt_history_window=2,
+        enable_memory=True,
+        inject_mode="in_loop",
+    )
+
+    result = agent.run_episode(_NoopEnv(), env_idx=1)
+
+    assert "Unverified immediate judge suggestion:" not in llm.prompts[0]
+    assert "Previous action appears to have failed." in llm.prompts[1]
+    assert "No verified memory was retrieved." in llm.prompts[1]
+    assert "Unverified immediate judge suggestion:" in llm.prompts[1]
+    assert "Suggested next action: inventory" in llm.prompts[1]
+    assert "Unverified immediate judge suggestion:" not in llm.prompts[2]
+    assert result["steps"][0]["judge_advice_injected"] is True

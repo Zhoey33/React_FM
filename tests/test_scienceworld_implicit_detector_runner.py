@@ -79,6 +79,10 @@ class FakeDetector:
         result.productive_signal = "none"
         result.evidence_for_failure = ["No new information."]
         result.evidence_against_failure = []
+        result.judge_repair_strategy = "Inspect inventory before repeating exploration."
+        result.judge_repair_action = "inventory"
+        result.judge_repair_confidence = 0.88
+        result.judge_repair_rationale = "Inventory may reveal tools that should guide the next step."
         return result
 
 
@@ -225,6 +229,11 @@ def test_judge_detected_failure_triggers_retrieval_and_enters_extraction(monkeyp
     assert step["failure_confidence"] == 0.9
     assert step["productive_signal"] == "none"
     assert step["evidence_for_failure"] == ["No new information."]
+    assert step["judge_repair_strategy"] == "Inspect inventory before repeating exploration."
+    assert step["judge_repair_action"] == "inventory"
+    assert step["judge_repair_confidence"] == 0.88
+    assert step["judge_repair_rationale"] == "Inventory may reveal tools that should guide the next step."
+    assert step["judge_advice_injected"] is False
 
     assert memory.retrieve_calls
     assert memory.retrieve_calls[0]["return_scores"] is True
@@ -291,6 +300,7 @@ def test_runner_logs_task_goal_and_retrieved_memory_content(caplog):
     assert "Retrieval candidates ids=[21]" in log_text
     assert "Selected memory #21" in log_text
     assert "repair_action=inventory" in log_text
+    assert "Injecting judge advice fallback" not in log_text
 
 
 def test_retrieval_observability_fields_are_recorded_for_failure_step():
@@ -322,6 +332,7 @@ def test_retrieval_observability_fields_are_recorded_for_failure_step():
     assert step["retrieval_selected_memory_id"] is None
     assert step["retrieval_relevance_decision"] is False
     assert step["retrieval_rejection_reason"] == "no_candidates"
+    assert step["judge_advice_injected"] is False
 
 
 def test_gated_retrieval_records_candidates_without_injecting_rejected_memory():
@@ -359,3 +370,41 @@ def test_gated_retrieval_records_candidates_without_injecting_rejected_memory():
     assert step["retrieval_selected_memory_id"] is None
     assert step["retrieval_relevance_decision"] is False
     assert step["retrieval_rejection_reason"] == "no_type_compatible_candidates"
+    assert step["judge_advice_injected"] is False
+
+
+def test_retrieved_memory_takes_priority_over_judge_advice():
+    detector = FakeDetector()
+    memory = FakeMemory(
+        RetrievalResult(
+            [
+                FakeMemoryEntry(
+                    memory_id=31,
+                    failure_type="implicit_no_progress",
+                    failure_action="look around",
+                    failure_observation="You see the same room.",
+                    repair_action="inventory",
+                    confidence_score=0.9,
+                )
+            ],
+            [0.04],
+            candidate_count=1,
+        )
+    )
+    agent = run_scienceworld.ScienceWorldReActAgent(
+        llm=FakeLLM(),
+        memory_store=memory,
+        failure_detector=detector,
+        extractor_llm=None,
+        max_steps=1,
+        max_memory_inject=1,
+        enable_memory=True,
+        inject_mode="in_loop",
+    )
+
+    result = agent.run_episode(FakeEnv(), env_idx=7)
+
+    step = result["steps"][0]
+    assert step["memory_retrieved"] == 1
+    assert step["retrieved_memory_ids"] == [31]
+    assert step["judge_advice_injected"] is False
