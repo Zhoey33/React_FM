@@ -48,6 +48,25 @@ _BAD_CONNECT_OBJECTS = {
     "workshop",
 }
 
+_FIXTURE_TERMS = {
+    "agent",
+    "bathroom",
+    "bedroom",
+    "counter",
+    "cupboard",
+    "door",
+    "drawer",
+    "freezer",
+    "fridge",
+    "hallway",
+    "kitchen",
+    "living",
+    "oven",
+    "room",
+    "stove",
+    "workshop",
+}
+
 _SAFE_FALLBACK_ACTIONS = {"inventory", "look", "look around"}
 
 
@@ -123,6 +142,8 @@ def is_repair_compatible(
     if repair_frame.intent == "circuit_connection":
         return _is_circuit_context(context) and not _has_bad_connect_object(repair_frame)
     if repair_frame.verb == "connect":
+        return False
+    if _has_bad_fixture_container_operation(repair_frame):
         return False
     if repair_frame.intent in {"examine_info", "wait"}:
         return repair_frame.verb in _SAFE_FALLBACK_ACTIONS or current_frame.intent in {
@@ -261,6 +282,14 @@ def _is_circuit_context(context: str) -> bool:
 
 def _has_bad_connect_object(frame: ActionIntentFrame) -> bool:
     return bool(frame.tokens & _BAD_CONNECT_OBJECTS)
+
+
+def _has_bad_fixture_container_operation(frame: ActionIntentFrame) -> bool:
+    if frame.intent != "container_use":
+        return False
+    if frame.verb not in {"mix", "pour", "dunk"}:
+        return False
+    return bool(frame.tokens & _FIXTURE_TERMS)
 
 
 def _action_items(valid_actions: str | Iterable[str]) -> list[str]:

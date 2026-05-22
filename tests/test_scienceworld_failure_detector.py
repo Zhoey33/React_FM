@@ -592,6 +592,37 @@ def test_generate_rule_repair_advice_rejects_connect_action_without_circuit_obje
     assert "open oven" in prompt
 
 
+def test_generate_rule_repair_advice_rejects_container_operation_on_fixture():
+    detector = ScienceWorldFailureDetector(
+        judge_llm=FakeJudgeLLM(
+            '{"repair_strategy": "Use a valid drawer interaction.", '
+            '"repair_action": "mix drawer in counter", '
+            '"repair_confidence": 0.95, '
+            '"repair_rationale": "The action appears in the valid action list."}'
+        ),
+        repair_confidence_threshold=0.7,
+    )
+
+    advice = detector.generate_rule_repair_advice(
+        action="open drawer (in counter, in kitchen)",
+        observation="No known action matches that input.",
+        failure_type="syntax_or_parse",
+        failure_reason="Action not recognized",
+        task_goal="Your task is to melt lead.",
+        look_after_action="You see a counter, a drawer, a cupboard, and an oven.",
+        valid_actions_after_action=[
+            "mix drawer in counter",
+            "open drawer in counter",
+            "examine drawer in counter",
+        ],
+    )
+
+    assert advice is None
+    prompt = detector.judge_llm.prompts[0]["prompt"]
+    assert "mix drawer in counter" not in prompt
+    assert "open drawer in counter" in prompt
+
+
 def test_generate_rule_repair_advice_accepts_connect_action_in_circuit_context():
     detector = ScienceWorldFailureDetector(
         judge_llm=FakeJudgeLLM(
