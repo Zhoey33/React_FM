@@ -62,6 +62,7 @@ def build_failure_events(episode: dict[str, Any], *, memory_mode: str) -> list[d
                 "judge_repair_action": step.get("judge_repair_action", ""),
                 "judge_repair_confidence": step.get("judge_repair_confidence"),
                 "judge_repair_rationale": step.get("judge_repair_rationale", ""),
+                "judge_advice_source": step.get("judge_advice_source", ""),
                 "judge_advice_injected": bool(step.get("judge_advice_injected", False)),
                 "failed_action": step.get("action", ""),
                 "failure_observation": step.get("observation", ""),

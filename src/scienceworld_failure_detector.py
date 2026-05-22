@@ -107,6 +107,57 @@ If is_failure is false, set repair_strategy, repair_action, and repair_rationale
 and repair_confidence to 0.0."""
 
 
+RULE_REPAIR_PROMPT = """You are generating one immediate repair suggestion for a ScienceWorld agent.
+
+Do not decide whether a failure happened. The rule-based detector already found a failure.
+Your job is only to suggest one valid next ScienceWorld action that may recover from it.
+
+Task type: {task_type}
+Variation index: {variation_idx}
+Step: {step}
+
+Task goal / initial observation:
+{task_goal}
+
+Recent history:
+{recent_history}
+
+Failed action: {action}
+Failure observation: {observation}
+Failure type: {failure_type}
+Detector reason: {failure_reason}
+Score before action: {score_before_action}
+Score after action: {score_after_action}
+Score delta: {score_delta}
+
+Look after action:
+{look_after_action}
+
+Inventory after action:
+{inventory_after_action}
+
+Valid actions after action:
+{valid_actions_after_action}
+
+Guidance:
+- For precondition_blocked, satisfy the blocked precondition before retrying.
+- If a door is not open, suggest the most specific valid open-door action from valid actions.
+- For syntax_or_parse, do not repeat the invalid command; choose the closest valid action.
+- For ambiguity, avoid vague object names; use a specific valid action or the requested numeric choice.
+- For action_loop, stop repeating and suggest look around, inventory, or a different task-relevant action.
+- Suggest exactly one next action, not a multi-step plan.
+
+Return ONLY valid JSON with this schema:
+{{
+  "repair_strategy": "short high-level repair direction",
+  "repair_action": "one valid next ScienceWorld action",
+  "repair_confidence": number between 0 and 1,
+  "repair_rationale": "short explanation"
+}}
+
+Keep repair_strategy and repair_rationale under 25 words each."""
+
+
 @dataclass
 class DetectionResult:
     is_failure: bool
@@ -121,10 +172,20 @@ class DetectionResult:
     judge_repair_action: str = ""
     judge_repair_confidence: float | None = None
     judge_repair_rationale: str = ""
+    judge_advice_source: str = ""
 
     @property
     def has_judge_repair_advice(self) -> bool:
         return bool(self.judge_repair_strategy and self.judge_repair_action)
+
+
+@dataclass(frozen=True)
+class RepairAdvice:
+    repair_strategy: str
+    repair_action: str
+    repair_confidence: float
+    repair_rationale: str
+    source: str = "rule_repair_judge"
 
 
 class ScienceWorldFailureDetector:
@@ -338,10 +399,92 @@ class ScienceWorldFailureDetector:
                 judge_repair_action=repair_action,
                 judge_repair_confidence=repair_confidence,
                 judge_repair_rationale=repair_rationale,
+                judge_advice_source="implicit_judge" if repair_strategy and repair_action else "",
             )
         except Exception as e:
             logger.warning(f"Judge LLM call failed: {e}")
         return DetectionResult(is_failure=False)
+
+    def generate_rule_repair_advice(
+        self,
+        *,
+        action: str,
+        observation: str,
+        failure_type: str,
+        failure_reason: str,
+        task_type: str = "",
+        task_goal: str = "",
+        recent_history: list[tuple[str, str]] | list[dict[str, Any]] | None = None,
+        score_before_action: float | int | None = None,
+        score_after_action: float | int | None = None,
+        step: int | None = None,
+        variation_idx: int | None = None,
+        look_after_action: str = "",
+        inventory_after_action: str = "",
+        valid_actions_after_action: str | list[str] = "",
+    ) -> RepairAdvice | None:
+        """Ask the judge LLM for one repair action after a rule-detected failure."""
+        if self.judge_llm is None:
+            return None
+        prompt = RULE_REPAIR_PROMPT.format(
+            action=action,
+            observation=observation,
+            failure_type=failure_type,
+            failure_reason=failure_reason,
+            task_type=task_type or "unknown",
+            variation_idx=variation_idx if variation_idx is not None else "unknown",
+            step=step if step is not None else "unknown",
+            task_goal=_compact_text(task_goal or "unknown"),
+            recent_history=_format_recent_history(recent_history or []),
+            score_before_action=score_before_action,
+            score_after_action=score_after_action,
+            score_delta=_score_delta(score_before_action, score_after_action),
+            look_after_action=_compact_text(look_after_action or "unknown"),
+            inventory_after_action=_compact_text(inventory_after_action or "unknown"),
+            valid_actions_after_action=_format_valid_actions(valid_actions_after_action),
+        )
+        try:
+            response = self.judge_llm.complete_text(
+                prompt,
+                label="rule_repair",
+                max_tokens=self.judge_max_tokens,
+            )
+            try:
+                payload = _parse_judge_json(response)
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(
+                    "Rule repair JSON parse failed: %s response=%s",
+                    e,
+                    _compact_text(response, max_chars=500),
+                )
+                return None
+            strategy, repair_action, confidence, rationale = _parse_repair_advice(
+                payload,
+                confidence_threshold=self.repair_confidence_threshold,
+            )
+            if not strategy or not repair_action or confidence is None:
+                logger.info(
+                    "Rule repair advice rejected: confidence=%s action=%s rationale=%s",
+                    confidence,
+                    _compact_text(str(payload.get("repair_action", "")), max_chars=120),
+                    _compact_text(str(payload.get("repair_rationale", "")), max_chars=180),
+                )
+                return None
+            logger.info(
+                "Rule repair advice accepted: action=%s confidence=%s rationale=%s",
+                repair_action,
+                confidence,
+                _compact_text(rationale, max_chars=180),
+            )
+            return RepairAdvice(
+                repair_strategy=strategy,
+                repair_action=repair_action,
+                repair_confidence=confidence,
+                repair_rationale=rationale,
+            )
+        except Exception as e:
+            logger.warning(f"Rule repair LLM call failed: {e}")
+        return None
 
     def is_task_complete(self, observation: str, done: bool, info: dict) -> tuple[bool, bool]:
         """Check if episode is over and whether it succeeded.

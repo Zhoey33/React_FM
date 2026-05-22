@@ -266,6 +266,7 @@ class ScienceWorldReActAgent:
         enable_safety_gate: bool = True,
         relevance_score_threshold: float = 0.45,
         enable_relevance_judge: bool = False,
+        enable_rule_repair_advice: bool = True,
     ):
         self.llm = llm
         self.memory = memory_store
@@ -284,6 +285,7 @@ class ScienceWorldReActAgent:
         self.enable_safety_gate = enable_safety_gate
         self.relevance_score_threshold = relevance_score_threshold
         self.enable_relevance_judge = enable_relevance_judge
+        self.enable_rule_repair_advice = enable_rule_repair_advice
 
     def _prompt_history(self, history: list[tuple[str, str]]) -> list[tuple[str, str]]:
         """Return the recent history slice used in ScienceWorld prompts."""
@@ -472,6 +474,7 @@ class ScienceWorldReActAgent:
                 "judge_repair_action": "",
                 "judge_repair_confidence": None,
                 "judge_repair_rationale": "",
+                "judge_advice_source": "",
                 "judge_advice_injected": False,
             }
 
@@ -512,6 +515,7 @@ class ScienceWorldReActAgent:
                     record["judge_repair_action"] = det.judge_repair_action
                     record["judge_repair_confidence"] = det.judge_repair_confidence
                     record["judge_repair_rationale"] = det.judge_repair_rationale
+                    record["judge_advice_source"] = det.judge_advice_source
                     failures_detected += 1
                     logger.info(
                         "    FAILURE detected: %s detector=%s confidence=%s "
@@ -617,6 +621,7 @@ class ScienceWorldReActAgent:
                                 "repair_confidence": det.judge_repair_confidence,
                                 "repair_rationale": det.judge_repair_rationale,
                             }
+                            record["judge_advice_source"] = det.judge_advice_source or "implicit_judge"
                             pending_judge_advice_record = record
                             logger.info(
                                 "    Scheduling judge advice fallback: strategy=%s action=%s "
@@ -626,6 +631,55 @@ class ScienceWorldReActAgent:
                                 det.judge_repair_confidence,
                                 _compact_log_text(det.judge_repair_rationale, 180),
                             )
+                        elif (
+                            self.enable_rule_repair_advice
+                            and det.detector_source == "rule"
+                            and hasattr(self.detector, "generate_rule_repair_advice")
+                        ):
+                            advice = self.detector.generate_rule_repair_advice(
+                                action=action,
+                                observation=observation,
+                                failure_type=det.failure_type,
+                                failure_reason=det.reason,
+                                task_type=task_type,
+                                task_goal=task_goal,
+                                recent_history=detector_history[-10:],
+                                score_before_action=score_before_action,
+                                score_after_action=final_score,
+                                step=step_num,
+                                variation_idx=variation_idx,
+                                look_after_action=look_after_action,
+                                inventory_after_action=inventory_after_action,
+                                valid_actions_after_action=valid_actions_after_action,
+                            )
+                            if advice is not None:
+                                current_failure_context = {
+                                    "action": action,
+                                    "observation": observation,
+                                    "failure_type": det.failure_type,
+                                    "detector_source": det.detector_source,
+                                    "failure_reason": det.reason,
+                                }
+                                current_judge_advice = {
+                                    "repair_strategy": advice.repair_strategy,
+                                    "repair_action": advice.repair_action,
+                                    "repair_confidence": advice.repair_confidence,
+                                    "repair_rationale": advice.repair_rationale,
+                                }
+                                record["judge_repair_strategy"] = advice.repair_strategy
+                                record["judge_repair_action"] = advice.repair_action
+                                record["judge_repair_confidence"] = advice.repair_confidence
+                                record["judge_repair_rationale"] = advice.repair_rationale
+                                record["judge_advice_source"] = advice.source
+                                pending_judge_advice_record = record
+                                logger.info(
+                                    "    Scheduling rule repair advice fallback: "
+                                    "strategy=%s action=%s confidence=%s rationale=%s",
+                                    _compact_log_text(advice.repair_strategy, 160),
+                                    _compact_log_text(advice.repair_action, 120),
+                                    advice.repair_confidence,
+                                    _compact_log_text(advice.repair_rationale, 180),
+                                )
 
             steps.append(record)
             history.append((action, observation))
@@ -830,6 +884,10 @@ def main():
         enable_safety_gate=config["memory"].get("enable_safety_gate", True),
         relevance_score_threshold=config["memory"].get("relevance_score_threshold", 0.45),
         enable_relevance_judge=config["memory"].get("enable_relevance_judge", False),
+        enable_rule_repair_advice=config.get("judge", {}).get(
+            "enable_rule_repair_advice",
+            True,
+        ),
     )
 
     task_names = args.tasks or DEFAULT_EVAL_TASKS

@@ -378,6 +378,98 @@ def test_low_confidence_or_malformed_judge_repair_advice_is_not_injectable():
         assert result.has_judge_repair_advice is False
 
 
+def test_generate_rule_repair_advice_parses_valid_json():
+    judge = FakeJudgeLLM(
+        '{"repair_strategy": "Open the blocked door before moving.", '
+        '"repair_action": "open door to hallway", '
+        '"repair_confidence": 0.91, '
+        '"repair_rationale": "The movement failed because the door is closed."}'
+    )
+    detector = ScienceWorldFailureDetector(
+        judge_llm=judge,
+        repair_confidence_threshold=0.7,
+    )
+
+    advice = detector.generate_rule_repair_advice(
+        action="go to hallway",
+        observation="The door is not open.",
+        failure_type="precondition_blocked",
+        failure_reason="Observation contains failure indicator: 'the door is not open'",
+        task_type="melt",
+        task_goal="Your task is to melt tin.",
+        recent_history=[{"step": 0, "action": "look around", "observation": "You see a door.", "score": 0}],
+        score_before_action=0,
+        score_after_action=0,
+        step=1,
+        variation_idx=3,
+        look_after_action="A door to the hallway (that is closed).",
+        inventory_after_action="In your inventory, you see: nothing.",
+        valid_actions_after_action="open door to hallway\ngo to hallway",
+    )
+
+    assert advice.repair_strategy == "Open the blocked door before moving."
+    assert advice.repair_action == "open door to hallway"
+    assert advice.repair_confidence == 0.91
+    assert advice.repair_rationale == "The movement failed because the door is closed."
+    assert advice.source == "rule_repair_judge"
+
+    call = judge.prompts[0]
+    assert call["label"] == "rule_repair"
+    assert call["max_tokens"] == 512
+    prompt = call["prompt"]
+    assert "Failure type: precondition_blocked" in prompt
+    assert "Failed action: go to hallway" in prompt
+    assert "Valid actions after action:" in prompt
+    assert "open door to hallway" in prompt
+    assert "Do not decide whether a failure happened" in prompt
+
+
+def test_generate_rule_repair_advice_rejects_invalid_outputs():
+    responses = [
+        '{"repair_strategy": "Maybe try something.", "repair_action": "inventory", '
+        '"repair_confidence": 0.2, "repair_rationale": "Weak guess."}',
+        '{"repair_strategy": "Try a valid action.", "repair_action": "", '
+        '"repair_confidence": 0.9, "repair_rationale": "Missing action."}',
+        '{"repair_strategy": "Try a valid action.", '
+        '"repair_action": "You should open the door first.", '
+        '"repair_confidence": 0.9, "repair_rationale": "Natural language."}',
+        '{"repair_strategy": "Open then move.", '
+        '"repair_action": "open door to hallway -> go to hallway", '
+        '"repair_confidence": 0.9, "repair_rationale": "Multi-action chain."}',
+    ]
+
+    for response in responses:
+        detector = ScienceWorldFailureDetector(
+            judge_llm=FakeJudgeLLM(response),
+            repair_confidence_threshold=0.7,
+        )
+
+        advice = detector.generate_rule_repair_advice(
+            action="go to hallway",
+            observation="The door is not open.",
+            failure_type="precondition_blocked",
+            failure_reason="door closed",
+        )
+
+        assert advice is None
+
+
+def test_generate_rule_repair_advice_malformed_json_or_exception_returns_none():
+    detectors = [
+        ScienceWorldFailureDetector(judge_llm=FakeJudgeLLM("not json")),
+        ScienceWorldFailureDetector(judge_llm=FakeJudgeLLM(exc=RuntimeError("network down"))),
+    ]
+
+    for detector in detectors:
+        advice = detector.generate_rule_repair_advice(
+            action="open door",
+            observation="Ambiguous request.",
+            failure_type="ambiguity",
+            failure_reason="ambiguous request",
+        )
+        assert advice is None
+
+
 def test_judge_malformed_json_or_exception_safely_returns_non_failure():
     malformed = ScienceWorldFailureDetector(
         judge_llm=FakeJudgeLLM("not json"),

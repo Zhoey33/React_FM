@@ -4,7 +4,7 @@ import logging
 
 from experiments import run_scienceworld
 from src.memory import RetrievalResult
-from src.scienceworld_failure_detector import DetectionResult
+from src.scienceworld_failure_detector import DetectionResult, RepairAdvice
 
 
 class FakeMemoryEntry:
@@ -86,6 +86,44 @@ class FakeDetector:
         return result
 
 
+class FakeRuleDetector:
+    judge_llm = None
+
+    def __init__(self, advice=None, failure_limit=None):
+        self.calls = []
+        self.repair_calls = []
+        self.failure_limit = failure_limit
+        self.advice = advice or RepairAdvice(
+            repair_strategy="Open the blocked door before retrying movement.",
+            repair_action="open door to hallway",
+            repair_confidence=0.9,
+            repair_rationale="The observation says the door is not open.",
+            source="rule_repair_judge",
+        )
+
+    def detect(self, observation, action, action_history, **kwargs):
+        self.calls.append(
+            {
+                "observation": observation,
+                "action": action,
+                "action_history": list(action_history),
+                **kwargs,
+            }
+        )
+        if self.failure_limit is not None and len(self.calls) > self.failure_limit:
+            return DetectionResult(is_failure=False)
+        return DetectionResult(
+            is_failure=True,
+            failure_type="precondition_blocked",
+            reason="Observation contains failure indicator: 'the door is not open'",
+            detector_source="rule",
+        )
+
+    def generate_rule_repair_advice(self, **kwargs):
+        self.repair_calls.append(kwargs)
+        return self.advice
+
+
 class FakeMemory:
     def __init__(self, retrieval_result=None):
         self.retrieve_calls = []
@@ -132,6 +170,17 @@ class FakeEnv:
                 "valid_actions": "look around\ninventory\ngo to hallway",
             },
         )
+
+
+class _PromptRecordingLLM:
+    def __init__(self):
+        self.tracker = _Tracker()
+        self.prompts = []
+        self.responses = ["go to hallway", "open door to hallway", "go to hallway"]
+
+    def complete_text(self, prompt, stop=None, label="", system=None):
+        self.prompts.append(prompt)
+        return self.responses[len(self.prompts) - 1]
 
 
 def test_resolve_enable_implicit_failures_prefers_cli_then_config():
@@ -407,4 +456,105 @@ def test_retrieved_memory_takes_priority_over_judge_advice():
     step = result["steps"][0]
     assert step["memory_retrieved"] == 1
     assert step["retrieved_memory_ids"] == [31]
+    assert step["judge_advice_injected"] is False
+
+
+def test_rule_failure_retrieval_miss_injects_rule_repair_advice_once():
+    llm = _PromptRecordingLLM()
+    detector = FakeRuleDetector(failure_limit=1)
+    memory = FakeMemory()
+    agent = run_scienceworld.ScienceWorldReActAgent(
+        llm=llm,
+        memory_store=memory,
+        failure_detector=detector,
+        extractor_llm=None,
+        max_steps=3,
+        max_memory_inject=1,
+        enable_memory=True,
+        inject_mode="in_loop",
+    )
+
+    result = agent.run_episode(FakeEnv(), env_idx=7)
+
+    assert detector.repair_calls
+    repair_call = detector.repair_calls[0]
+    assert repair_call["action"] == "go to hallway"
+    assert repair_call["failure_type"] == "precondition_blocked"
+    assert repair_call["failure_reason"] == "Observation contains failure indicator: 'the door is not open'"
+    assert repair_call["valid_actions_after_action"] == "look around\ninventory\ngo to hallway"
+
+    assert "Unverified immediate judge suggestion:" not in llm.prompts[0]
+    assert "Previous action appears to have failed." in llm.prompts[1]
+    assert "No verified memory was retrieved." in llm.prompts[1]
+    assert "Unverified immediate judge suggestion:" in llm.prompts[1]
+    assert "Detector source: rule" in llm.prompts[1]
+    assert "Suggested next action: open door to hallway" in llm.prompts[1]
+    assert "Unverified immediate judge suggestion:" not in llm.prompts[2]
+
+    first_step = result["steps"][0]
+    assert first_step["judge_repair_strategy"] == "Open the blocked door before retrying movement."
+    assert first_step["judge_repair_action"] == "open door to hallway"
+    assert first_step["judge_repair_confidence"] == 0.9
+    assert first_step["judge_repair_rationale"] == "The observation says the door is not open."
+    assert first_step["judge_advice_source"] == "rule_repair_judge"
+    assert first_step["judge_advice_injected"] is True
+
+
+def test_rule_failure_retrieval_hit_does_not_call_rule_repair_advice():
+    detector = FakeRuleDetector()
+    memory = FakeMemory(
+        RetrievalResult(
+            [
+                FakeMemoryEntry(
+                    memory_id=41,
+                    failure_type="precondition_blocked",
+                    failure_action="go to hallway",
+                    failure_observation="The door is not open.",
+                    repair_action="open door to hallway",
+                    confidence_score=0.9,
+                )
+            ],
+            [0.04],
+            candidate_count=1,
+        )
+    )
+    agent = run_scienceworld.ScienceWorldReActAgent(
+        llm=_PromptRecordingLLM(),
+        memory_store=memory,
+        failure_detector=detector,
+        extractor_llm=None,
+        max_steps=1,
+        max_memory_inject=1,
+        enable_memory=True,
+        inject_mode="in_loop",
+    )
+
+    result = agent.run_episode(FakeEnv(), env_idx=7)
+
+    step = result["steps"][0]
+    assert step["memory_retrieved"] == 1
+    assert step["judge_advice_injected"] is False
+    assert step["judge_advice_source"] == ""
+    assert detector.repair_calls == []
+
+
+def test_rule_repair_advice_scheduled_on_last_step_is_not_marked_injected():
+    detector = FakeRuleDetector()
+    memory = FakeMemory()
+    agent = run_scienceworld.ScienceWorldReActAgent(
+        llm=FakeLLM(),
+        memory_store=memory,
+        failure_detector=detector,
+        extractor_llm=None,
+        max_steps=1,
+        max_memory_inject=1,
+        enable_memory=True,
+        inject_mode="in_loop",
+    )
+
+    result = agent.run_episode(FakeEnv(), env_idx=7)
+
+    step = result["steps"][0]
+    assert detector.repair_calls
+    assert step["judge_advice_source"] == "rule_repair_judge"
     assert step["judge_advice_injected"] is False
